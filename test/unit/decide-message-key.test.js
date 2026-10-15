@@ -1,17 +1,16 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
 const { EvernodeContext } = require('../../dist');
+const { createWorkDir } = require('./test-workdir');
 
-describe('Fix 3: decideMessageKey returns lexicographically first vote', () => {
+describe('Fix 3: decideMessageKey', () => {
     let tmpDir;
     let originalCwd;
 
     beforeEach(() => {
-        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'evp-msgkey-'));
+        tmpDir = createWorkDir('evp-msgkey');
         originalCwd = process.cwd();
         process.chdir(tmpDir);
         fs.writeFileSync('acquires.json', JSON.stringify({ acquiredNodes: [], pendingAcquires: [] }));
@@ -22,9 +21,9 @@ describe('Fix 3: decideMessageKey returns lexicographically first vote', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it('returns sortCollection[0] (canonical vote), not the first collected vote datum', async () => {
-        const unsortedFirst = 'z_vote_pubkey_should_not_win';
+    it('returns the lexicographically smallest vote key', async () => {
         const sortedFirst = 'a_vote_pubkey_should_win';
+        const unsortedFirst = 'z_vote_pubkey_should_not_win';
 
         const voteContext = {
             getUniqueNumber: () => 1,
@@ -39,30 +38,9 @@ describe('Fix 3: decideMessageKey returns lexicographically first vote', () => {
             publicKey: 'self',
         };
 
-        const xrplContext = { hpContext, voteContext };
-        const evernodeContext = new EvernodeContext(xrplContext);
-
-        const voteResults = [
-            { data: unsortedFirst },
-            { data: sortedFirst },
-        ];
-
+        const evernodeContext = new EvernodeContext({ hpContext, voteContext });
         const chosen = await evernodeContext.decideMessageKey();
-        const firstCollected = voteResults.map((v) => v.data)[0];
-        const canonical = [...voteResults.map((v) => v.data)].sort((a, b) => a.localeCompare(b))[0];
 
-        assert.strictEqual(chosen, canonical);
         assert.strictEqual(chosen, sortedFirst);
-        assert.notStrictEqual(firstCollected, canonical);
-        assert.notStrictEqual(chosen, firstCollected);
-
-        const brokenNonMutatingReturn = (results) => {
-            const collection = results.map((v) => v.data);
-            const sortCollection = [...collection].sort((a, b) => a.localeCompare(b));
-            return collection[0];
-        };
-        assert.strictEqual(brokenNonMutatingReturn(voteResults), firstCollected);
-        assert.notStrictEqual(brokenNonMutatingReturn(voteResults), canonical);
-        assert.notStrictEqual(chosen, brokenNonMutatingReturn(voteResults));
     });
 });

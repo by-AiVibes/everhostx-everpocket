@@ -142,21 +142,28 @@ class ClusterContext {
      * Process operations one by one at each execution.
      * @param deferAdd When true, skip ADD_NODE ops this round (pending aliveness probe).
      */
+    #findProcessableOperationIndex(deferAdd: boolean, curLcl: number): number {
+        for (let i = 0; i < this.operationData.operations.length; i++) {
+            const op = this.operationData.operations[i];
+            if (deferAdd && op.type === OperationType.ADD_NODE)
+                continue;
+            if (op.nextRetryLcl !== undefined && op.nextRetryLcl > curLcl)
+                continue;
+            return i;
+        }
+        return -1;
+    }
+
     async #processOperations(deferAdd: boolean = false) {
         if (this.operationData.operations.length === 0)
             return;
 
-        let operationIndex = 0;
-        if (deferAdd) {
-            operationIndex = this.operationData.operations.findIndex(o => o.type !== OperationType.ADD_NODE);
-            if (operationIndex < 0)
-                return;
-        }
+        const curLcl = this.hpContext.lclSeqNo;
+        const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl);
+        if (operationIndex < 0)
+            return;
 
         const operation = this.operationData.operations[operationIndex];
-        const curLcl = this.hpContext.lclSeqNo;
-        if (operation.nextRetryLcl !== undefined && operation.nextRetryLcl > curLcl)
-            return;
 
         info(`Operations processor started.`);
 

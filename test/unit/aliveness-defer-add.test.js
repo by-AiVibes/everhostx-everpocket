@@ -1,65 +1,44 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
-const { ClusterContext } = require('../../dist');
 const { OperationType } = require('../../dist/models/cluster');
+const { createWorkDir } = require('./test-workdir');
+const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, buildClusterContext } = require('./cluster-test-helpers');
 
 const DEAD_PUBKEY = 'dead_node_pubkey_aliveness_test';
 const PENDING_REF = 'pending_acquire_aliveness_ref';
-
-function writeFixture() {
-    fs.writeFileSync('cluster.json', JSON.stringify({
-        initialized: true,
-        nodes: [{
-            pubkey: DEAD_PUBKEY,
-            contractId: 'cid',
-            isUnl: false,
-            lifeMoments: 1,
-            targetLifeMoments: 1,
-            owner: 1,
-            status: { status: 1, onLcl: 1 },
-        }],
-        pendingNodes: [{
-            refId: PENDING_REF,
-            host: 'host.example',
-            targetLifeMoments: 1,
-            aliveCheckCount: 0,
-        }],
-    }, null, 4));
-
-    fs.writeFileSync('operations.json', JSON.stringify({
-        operations: [
-            {
-                type: OperationType.ADD_NODE,
-                ref: 'add_op_ref',
-                data: {
-                    acquireOptions: {},
-                    lifeMoments: 1,
-                    maxLifeMoments: 0,
-                },
-            },
-            {
-                type: OperationType.REMOVE_NODE,
-                ref: DEAD_PUBKEY,
-                data: { nodePubkey: DEAD_PUBKEY, force: true },
-            },
-        ],
-    }, null, 4));
-}
 
 describe('Fix 5: pending aliveness defers ADD only', () => {
     let tmpDir;
     let originalCwd;
 
     beforeEach(() => {
-        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'evp-alive-'));
+        tmpDir = createWorkDir('evp-alive');
         originalCwd = process.cwd();
         process.chdir(tmpDir);
-        fs.writeFileSync('acquires.json', JSON.stringify({ acquiredNodes: [], pendingAcquires: [] }));
-        writeFixture();
+        writeAcquiresFile();
+        writeClusterFiles({
+            nodes: [defaultClusterNode(DEAD_PUBKEY)],
+            pendingNodes: [{
+                refId: PENDING_REF,
+                host: 'host.example',
+                targetLifeMoments: 1,
+                aliveCheckCount: 0,
+            }],
+            operations: [
+                {
+                    type: OperationType.ADD_NODE,
+                    ref: 'add_op_ref',
+                    data: { acquireOptions: {}, lifeMoments: 1, maxLifeMoments: 0 },
+                },
+                {
+                    type: OperationType.REMOVE_NODE,
+                    ref: DEAD_PUBKEY,
+                    data: { nodePubkey: DEAD_PUBKEY, force: true },
+                },
+            ],
+        });
     });
 
     afterEach(() => {
@@ -68,32 +47,7 @@ describe('Fix 5: pending aliveness defers ADD only', () => {
     });
 
     it('processes REMOVE while a pending-node aliveness check runs (ADD stays queued)', async () => {
-        const hpContext = {
-            publicKey: 'self_pubkey',
-            contractId: 'contract_id',
-            lclSeqNo: 200,
-            lclHash: 'hash',
-            timestamp: Date.now(),
-            getContractConfig: async () => ({
-                unl: [],
-                consensus: { roundtime: 1000, stage_slice: 100 },
-            }),
-            getContractUnl: () => [],
-            updateContractConfig: async () => {},
-            updatePeers: async () => {},
-            checkLiveness: async () => false,
-        };
-
-        const voteContext = {
-            getUniqueNumber: () => 1,
-            vote: async () => [],
-        };
-
-        const evernodeContext = {
-            hpContext,
-            voteContext,
-            init: async () => {},
-            deinit: async () => {},
+        const ctx = buildClusterContext({
             getIfAcquired: (refId) => {
                 if (refId !== PENDING_REF) return null;
                 return {
@@ -110,11 +64,8 @@ describe('Fix 5: pending aliveness defers ADD only', () => {
             acquireNode: async () => {
                 throw new Error('ADD must be deferred during aliveness check');
             },
-            extendSubmit: async () => false,
-            xrplContext: { multiSigner: { isSignerNode: () => false, getSigner: () => null } },
-        };
+        }, { lclSeqNo: 200 });
 
-        const ctx = new ClusterContext(evernodeContext);
         await ctx.init();
         await ctx.deinit();
 

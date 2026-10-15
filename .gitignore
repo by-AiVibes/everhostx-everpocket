@@ -1,4 +1,5 @@
 node_modules
+test/.work/
 **/dist/**
 !hp.cfg.override
 !streamer.config
