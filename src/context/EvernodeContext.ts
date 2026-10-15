@@ -309,16 +309,16 @@ class EvernodeContext {
 
         const electionName = `message_key_selection${this.voteContext.getUniqueNumber()}`;
         const voteRound = this.voteContext.vote(electionName, [keyPair.publicKey], new AllVoteElector(this.hpContext.getContractUnl().length, options?.timeout || TIMEOUT));
-        let collection = (await voteRound).map((v) => v.data);
+        const collection = (await voteRound).map((v) => v.data);
 
-        let sortCollection = collection.sort((a, b) => a.localeCompare(b));
+        const sortCollection = [...collection].sort((a, b) => a.localeCompare(b));
 
         if (sortCollection[0] === keyPair.publicKey) {
             fs.writeFileSync(`../${keyPair.publicKey}.txt`, keyPair.privateKey);
             log("Wrote Key file.");
         }
 
-        return collection[0];
+        return sortCollection[0];
     }
 
     /**

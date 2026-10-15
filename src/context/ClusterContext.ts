@@ -19,6 +19,7 @@ const ACKNOWLEDGE_LCL_THRESHOLD = 2;
 const ACKNOWLEDGE_RETRY_LCL_THRESHOLD = 5;
 const MAX_ACKNOWLEDGE_ATTEMPTS = 3;
 const MAX_SIGNER_REPLACE_ATTEMPTS = 10;
+const MAX_OPERATION_RETRY_ATTEMPTS = 32;
 const TIMEOUT = 10000;
 
 class ClusterContext {
@@ -69,10 +70,9 @@ class ClusterContext {
             await this.#checkForMatured();
             await this.#checkForAcknowledged();
             await this.#checkForExtends();
-            // We do not process operations if aliveness check is tried in this round.
-            // Because user connection takes time, So due to that some nodes might be unstable.
-            if (!aliveCheckReached)
-                await this.#processOperations();
+            // Defer only new ADD operations while a pending-node aliveness probe ran this round.
+            // REMOVE and EXTEND must still run so heal is not blocked by in-flight acquires.
+            await this.#processOperations(aliveCheckReached);
             this.initialized = true;
         } catch (e) {
             await this.deinit();
@@ -140,15 +140,25 @@ class ClusterContext {
 
     /**
      * Process operations one by one at each execution.
+     * @param deferAdd When true, skip ADD_NODE ops this round (pending aliveness probe).
      */
-    async #processOperations() {
+    async #processOperations(deferAdd: boolean = false) {
         if (this.operationData.operations.length === 0)
             return;
 
-        info(`Operations processor started.`);
+        let operationIndex = 0;
+        if (deferAdd) {
+            operationIndex = this.operationData.operations.findIndex(o => o.type !== OperationType.ADD_NODE);
+            if (operationIndex < 0)
+                return;
+        }
 
-        const operation = this.operationData.operations.splice(0, 1)[0];
-        this.updatedData = true;
+        const operation = this.operationData.operations[operationIndex];
+        const curLcl = this.hpContext.lclSeqNo;
+        if (operation.nextRetryLcl !== undefined && operation.nextRetryLcl > curLcl)
+            return;
+
+        info(`Operations processor started.`);
 
         try {
             if (operation.type === OperationType.ADD_NODE) {
@@ -271,8 +281,21 @@ class ClusterContext {
                     this.clusterManager.removeNode(pubkey);
                 }
             }
+
+            this.operationData.operations.splice(operationIndex, 1);
+            this.updatedData = true;
         } catch (e) {
             error(e);
+            const retryCount = (operation.retryCount || 0) + 1;
+            operation.retryCount = retryCount;
+            if (retryCount >= MAX_OPERATION_RETRY_ATTEMPTS) {
+                error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_RETRY_ATTEMPTS} failed attempts.`);
+                this.operationData.operations.splice(operationIndex, 1);
+            } else {
+                const backoffLcl = Math.min(2 ** retryCount, 32);
+                operation.nextRetryLcl = curLcl + backoffLcl;
+            }
+            this.updatedData = true;
         }
 
         info(`Operations processor ended.`);

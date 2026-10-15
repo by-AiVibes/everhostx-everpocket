@@ -71,7 +71,9 @@ export interface RemoveNodeOperation {
 export interface Operation {
   type: OperationType,
   ref: string,
-  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation
+  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation,
+  retryCount?: number,
+  nextRetryLcl?: number
 }
 
 export interface OperationData {
