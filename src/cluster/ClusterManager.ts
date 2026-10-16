@@ -285,6 +285,10 @@ class ClusterManager {
             this.updated = true;
         }
     }
+
+    public snapshotClusterData(): ClusterData {
+        return JSON.parse(JSON.stringify(this.clusterData));
+    }
 }
 
 export default ClusterManager;

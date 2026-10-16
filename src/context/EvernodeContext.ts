@@ -48,28 +48,37 @@ class EvernodeContext {
         if (this.initialized)
             return;
 
-        await this.xrplContext.init();
+        await this.bootstrapForRound();
+        await this.finishRoundInit();
+        this.initialized = true;
+    }
 
-        try {
+    public async bootstrapForRound(): Promise<void> {
+        await this.xrplContext.bootstrapForRound();
+    }
+
+    public async finishRoundInit(): Promise<void> {
+        if (!this.registryClient) {
             this.registryClient = await evernode.HookClientFactory.create(evernode.HookTypes.registry);
             await this.registryClient.connect();
-
-            await this.#checkForCompletedAcquires();
-            this.initialized = true;
-        } catch (e) {
-            await this.deinit();
-            throw e;
         }
+        await this.#checkForCompletedAcquires();
+    }
+
+    public getAcquireDataSnapshot(): AcquireData {
+        return JSON.parse(JSON.stringify(this.acquireData));
     }
 
     /**
      * Deinitialize the context.
      */
-    public async deinit(): Promise<void> {
-        this.#persistAcquireData();
+    public async deinit(roundAborted: boolean = false): Promise<void> {
+        if (!roundAborted)
+            this.#persistAcquireData();
         if (this.registryClient)
             await this.registryClient.disconnect();
-        await this.xrplContext.deinit();
+        this.registryClient = null as any;
+        await this.xrplContext.deinit(roundAborted);
         this.initialized = false;
     }
 

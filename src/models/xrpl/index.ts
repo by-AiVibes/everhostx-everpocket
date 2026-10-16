@@ -43,6 +43,7 @@ export interface DecisionOptions {
 export interface TransactionSubmissionInfo {
   sequence: number;
   maxLedgerSequence: number;
+  fee?: string;
   options?: DecisionOptions;
 }
 

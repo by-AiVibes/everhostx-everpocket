@@ -61,21 +61,35 @@ export interface AddNodeOperation {
 export interface ExtendNodeOperation {
   nodePubkey: string;
   moments: number;
+  extendTxHash?: string;
+  extendLedgerCap?: number;
 }
 
 export interface RemoveNodeOperation {
   nodePubkey: string;
   force: boolean;
+  signerTxCap?: number;
 }
 
 export interface Operation {
   type: OperationType,
   ref: string,
-  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation
+  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation,
+  attempt?: number;
+  nextAttemptLcl?: number;
+  createdLcl?: number;
+  /** @deprecated migrated to attempt */
+  retryCount?: number;
+  /** @deprecated migrated to nextAttemptLcl */
+  nextRetryLcl?: number;
 }
 
 export interface OperationData {
-  operations: Operation[]
+  operations: Operation[];
+  /** Agreed Xahau ledger anchor for deterministic queue rounds. */
+  anchorLedger?: number;
+  /** Agreed tenant account sequence at round boundary. */
+  tenantSequence?: number;
 }
 
 export enum ClusterMessageType {
