@@ -44,7 +44,7 @@ function defaultClusterNode(pubkey) {
     };
 }
 
-function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
+function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}, clusterOptions = {}) {
     const hpContext = {
         publicKey: 'self_pubkey',
         contractId: 'contract_id',
@@ -81,7 +81,7 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
     };
 
     evernodeContext.hpContext = hpContext;
-    return new ClusterContext(evernodeContext);
+    return new ClusterContext(evernodeContext, clusterOptions);
 }
 
 async function runClusterRound(evernodeOverrides, hpOverrides) {

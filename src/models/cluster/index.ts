@@ -14,6 +14,7 @@ export interface ClusterOptions {
   maturityLclThreshold?: number;
   acknowledgeLclThreshold?: number;
   acknowledgeRetryLclThreshold?: number;
+  maxOpsPerRound?: number;
 }
 
 export interface ClusterNode extends AcquiredNode {
