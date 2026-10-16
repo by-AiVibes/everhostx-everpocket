@@ -80,6 +80,8 @@ export interface Operation {
   createdLcl?: number;
   /** Set when quorum shows the pinned sequence consumed by a different tx. */
   extendHoldReason?: string;
+  /** Quorum-agreed submit identity already counted toward attempt (hash|lls|rc). */
+  quorumCountedSubmitKey?: string;
   /** @deprecated migrated to attempt */
   retryCount?: number;
   /** @deprecated migrated to nextAttemptLcl */

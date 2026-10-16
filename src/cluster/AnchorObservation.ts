@@ -1,5 +1,6 @@
 import { Buffer } from 'buffer';
-import { OperationData } from '../models/cluster';
+import { ExtendNodeOperation, OperationData, OperationType } from '../models/cluster';
+import { backoffLcl, operationAttempt } from './OperationQueueProcessor';
 import * as kp from 'ripple-keypairs';
 
 export const ANCHOR_OBSERVATION_MESSAGE_TYPE = 'anchor_observation';
@@ -109,6 +110,21 @@ export function parseAnchorUserMessage(raw: Buffer | string): AnchorUserMessage 
     }
 }
 
+function resolveExtendOpRef(operationData: OperationData | undefined, txRef: string): string | null {
+    if (!operationData)
+        return txRef;
+    for (const op of operationData.operations) {
+        if (op.type !== OperationType.EXTEND_NODE)
+            continue;
+        if (op.ref === txRef)
+            return op.ref;
+        const data = op.data as ExtendNodeOperation;
+        if (data.nodePubkey === txRef)
+            return op.ref;
+    }
+    return txRef;
+}
+
 function modeWithQuorumDistinctUnl(
     observations: ParsedObservation[],
     valueFn: (o: ParsedObservation) => string,
@@ -212,7 +228,11 @@ function selectAnchorCandidate(observations: ParsedObservation[], quorum: number
     return candidates[0];
 }
 
-function mergeAgreedExtendResults(observations: ParsedObservation[], quorum: number): Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }> {
+function mergeAgreedExtendResults(
+    observations: ParsedObservation[],
+    quorum: number,
+    operationData?: OperationData,
+): Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }> {
     const out: Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }> = {};
     const byRef = new Map<string, Map<string, { unls: Set<string>; sample: SubmittedTxObservation }>>();
 
@@ -223,9 +243,12 @@ function mergeAgreedExtendResults(observations: ParsedObservation[], quorum: num
             continue;
         nodesSeen.add(unl);
         for (const tx of o.submittedTx || []) {
-            if (!byRef.has(tx.ref))
-                byRef.set(tx.ref, new Map());
-            const refMap = byRef.get(tx.ref)!;
+            const opRef = resolveExtendOpRef(operationData, tx.ref);
+            if (!opRef)
+                continue;
+            if (!byRef.has(opRef))
+                byRef.set(opRef, new Map());
+            const refMap = byRef.get(opRef)!;
             const key = `${tx.hash}|${tx.lastLedgerSequence}|${tx.resultCode}`;
             if (!refMap.has(key))
                 refMap.set(key, { unls: new Set(), sample: tx });
@@ -350,16 +373,18 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
     const quorum = quorumThreshold(contractUnl.length);
     const result = aggregateAnchorFromObservations(accepted, contractUnl);
     if (result) {
-        const prev = operationData.anchorLedger ?? 0;
+        const prev = operationData.anchorLedger !== undefined ? operationData.anchorLedger : 0;
         if (result.anchorLedger > prev) {
             operationData.anchorLedger = result.anchorLedger;
             operationData.agreedLedgerHash = result.ledgerHash;
-            operationData.agreedTenantSequence = result.tenantSequence;
             operationData.agreedSignerListHash = result.signerListHash;
         }
+        const curTs = operationData.agreedTenantSequence;
+        if (curTs === undefined || result.tenantSequence > curTs)
+            operationData.agreedTenantSequence = result.tenantSequence;
     }
 
-    const extendMerged = mergeAgreedExtendResults(accepted, quorum);
+    const extendMerged = mergeAgreedExtendResults(accepted, quorum, operationData);
     if (Object.keys(extendMerged).length > 0) {
         operationData.agreedExtendResults = {
             ...(operationData.agreedExtendResults || {}),
@@ -367,5 +392,33 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
         };
     }
 
+    applyAgreedExtendAttemptIncrements(operationData, accepted, quorum, currentLcl);
+
     return accepted;
+}
+
+/** Attempt/backoff counters advance only from quorum-agreed submittedTx reports (never local submit). */
+export function applyAgreedExtendAttemptIncrements(
+    operationData: OperationData,
+    accepted: ParsedObservation[],
+    quorum: number,
+    currentLcl: number,
+): void {
+    const merged = mergeAgreedExtendResults(accepted, quorum, operationData);
+    for (const [ref, agreed] of Object.entries(merged)) {
+        if (agreed.resultCode !== 'tesSUCCESS')
+            continue;
+        const op = operationData.operations.find((o) => o.ref === ref && o.type === OperationType.EXTEND_NODE);
+        if (!op)
+            continue;
+        const submitKey = `${agreed.hash}|${agreed.lastLedgerSequence}|${agreed.resultCode}`;
+        if (op.quorumCountedSubmitKey === submitKey)
+            continue;
+        op.quorumCountedSubmitKey = submitKey;
+        const attempt = operationAttempt(op) + 1;
+        op.attempt = attempt;
+        op.nextAttemptLcl = currentLcl + backoffLcl(attempt);
+        delete op.retryCount;
+        delete op.nextRetryLcl;
+    }
 }

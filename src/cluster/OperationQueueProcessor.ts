@@ -10,11 +10,17 @@ export const MAX_OPERATION_ATTEMPTS = 8;
 export const MAX_OPS_PER_ROUND = 1;
 
 export function operationAttempt(operation: Operation): number {
-    return operation.attempt ?? operation.retryCount ?? 0;
+    if (operation.attempt !== undefined)
+        return operation.attempt;
+    if (operation.retryCount !== undefined)
+        return operation.retryCount;
+    return 0;
 }
 
 export function operationNextAttemptLcl(operation: Operation): number | undefined {
-    return operation.nextAttemptLcl ?? operation.nextRetryLcl;
+    if (operation.nextAttemptLcl !== undefined)
+        return operation.nextAttemptLcl;
+    return operation.nextRetryLcl;
 }
 
 export function backoffLcl(attempt: number): number {

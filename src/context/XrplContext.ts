@@ -642,7 +642,9 @@ class XrplContext {
     public getValidatedLedgerIndex(): number {
         if (this.xahauLedger)
             return this.xahauLedger.getValidatedLedgerIndex();
-        return this.xrplApi?.ledgerIndex ?? 0;
+        if (this.xrplApi && this.xrplApi.ledgerIndex !== undefined)
+            return this.xrplApi.ledgerIndex;
+        return 0;
     }
 
     public setXahauLedgerBackend(backend: XahauLedgerBackend | null): void {
@@ -684,8 +686,11 @@ class XrplContext {
             return null;
         try {
             const res = await this.xrplApi.request({ command: 'ledger', ledger_index: ledgerIndex });
-            const ledger = res?.result?.ledger ?? res?.ledger;
-            return ledger?.ledger_hash ?? null;
+            const result = res && res.result ? res.result : res;
+            const ledger = result && result.ledger ? result.ledger : null;
+            if (ledger && ledger.ledger_hash)
+                return ledger.ledger_hash;
+            return null;
         } catch {
             return null;
         }

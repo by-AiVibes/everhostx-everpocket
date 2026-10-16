@@ -2,6 +2,7 @@ import { VoteContext, XrplContext } from ".";
 import { AcquireData, AcquireOptions, AcquiredNode, Instance, LeaseURIInfo, PendingAcquire } from "../models/evernode";
 import * as evernode from 'evernode-js-client';
 import { Buffer } from 'buffer';
+import { randomBytes } from 'crypto';
 import { AllVoteElector } from "../vote/vote-electors";
 import { URIToken } from "../models";
 import * as fs from 'fs';
@@ -369,8 +370,9 @@ class EvernodeContext {
         const tenantClient = new evernode.TenantClient(this.xrplContext.xrplAcc.address);
         await tenantClient.connect();
 
-        const seed = Buffer.from(this.hpContext.lclHash, "hex");
-        const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(hostAddress, { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messageKey }, { leaseOfferIndex: leaseOffer.index, iv: seed.slice(0, 16), ephemPrivateKey: seed.slice(0, 32) })
+        const iv = randomBytes(16);
+        const ephemPrivateKey = randomBytes(32);
+        const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(hostAddress, { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messageKey }, { leaseOfferIndex: leaseOffer.index, iv, ephemPrivateKey })
         await tenantClient.disconnect();
 
         return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
@@ -407,7 +409,9 @@ class EvernodeContext {
         const entry: SubmittedTxObservation = {
             ref: options.extendOpRef,
             hash: res.hash,
-            lastLedgerSequence: options.txSubmitInfo?.maxLedgerSequence ?? 0,
+            lastLedgerSequence: options.txSubmitInfo && options.txSubmitInfo.maxLedgerSequence !== undefined
+                ? options.txSubmitInfo.maxLedgerSequence
+                : 0,
             resultCode: res.code === 'tesSUCCESS' ? 'tesSUCCESS' : (res.code || 'unknown'),
         };
         this.observationPendingSubmits.push(entry);

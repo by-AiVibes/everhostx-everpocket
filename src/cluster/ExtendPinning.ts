@@ -65,26 +65,24 @@ export function shouldRepinPinnedExtend(
     operationData: OperationData,
     pin: PinnedExtendTx,
     anchorLedger: number,
+    opRef: string,
 ): boolean {
     if (pin.lastLedgerSequence >= anchorLedger)
+        return false;
+    const agreedResult = operationData.agreedExtendResults?.[opRef];
+    if (agreedResult?.resultCode === 'tesSUCCESS' && agreedResult.lastLedgerSequence === pin.lastLedgerSequence)
         return false;
     const agreed = operationData.agreedTenantSequence;
     if (agreed === undefined)
         return true;
-    return agreed <= pin.sequence;
+    if (agreed > pin.sequence)
+        return false;
+    return true;
 }
 
-export function findInFlightExtendRef(operationData: OperationData, anchorLedger: number): string | null {
-    const pins = operationData.pinnedExtendTxs;
-    if (!pins)
-        return null;
+export function findInFlightExtendRef(operationData: OperationData, _anchorLedger: number): string | null {
     for (const op of operationData.operations) {
         if (op.type !== OperationType.EXTEND_NODE || op.extendHoldReason)
-            continue;
-        const pin = pins[op.ref];
-        if (!pin)
-            continue;
-        if (pin.lastLedgerSequence < anchorLedger)
             continue;
         return op.ref;
     }
@@ -101,7 +99,13 @@ export function quorumExtendCompletesOp(operationData: OperationData, operation:
     if (agreed.lastLedgerSequence !== pin.lastLedgerSequence)
         return false;
     const data = operation.data as ExtendNodeOperation;
-    return data.nodePubkey === pin.nodePubkey && data.moments === pin.moments;
+    if (data.nodePubkey !== pin.nodePubkey || data.moments !== pin.moments)
+        return false;
+    const tenantSeq = operationData.agreedTenantSequence;
+    if (tenantSeq !== undefined && tenantSeq > pin.sequence)
+        return true;
+    const anchor = operationData.anchorLedger !== undefined ? operationData.anchorLedger : 0;
+    return anchor >= pin.lastLedgerSequence;
 }
 
 export function detectPinnedExtendConflict(
@@ -114,8 +118,8 @@ export function detectPinnedExtendConflict(
     const agreed = operationData.agreedExtendResults?.[operation.ref];
     if (agreed?.resultCode === 'tesSUCCESS' && agreed.lastLedgerSequence !== pin.lastLedgerSequence)
         return `quorum extend LLS ${agreed.lastLedgerSequence} != pin ${pin.lastLedgerSequence}`;
-    const tenantSeq = operationData.agreedTenantSequence;
-    if (tenantSeq !== undefined && tenantSeq > pin.sequence) {
+    const consumed = operationData.consumedTenantSequences || [];
+    if (consumed.includes(pin.sequence)) {
         if (!agreed || agreed.resultCode !== 'tesSUCCESS')
             return `tenant sequence ${pin.sequence} consumed without quorum tesSUCCESS for ${operation.ref}`;
         const data = operation.data as ExtendNodeOperation;
@@ -143,10 +147,18 @@ export function buildExtendLedgerChecksFromQuorum(
                 lastLedgerSequence: agreed.lastLedgerSequence,
             };
         }
+        let hash = '';
+        if (agreed)
+            hash = agreed.hash;
+        let lastLedgerSequence = 0;
+        if (pin)
+            lastLedgerSequence = pin.lastLedgerSequence;
+        else if (agreed)
+            lastLedgerSequence = agreed.lastLedgerSequence;
         checks.push({
             ref: op.ref,
-            hash: agreed?.hash ?? '',
-            lastLedgerSequence: pin?.lastLedgerSequence ?? agreed?.lastLedgerSequence ?? 0,
+            hash,
+            lastLedgerSequence,
             tx,
         });
     }
@@ -162,7 +174,7 @@ export function ensurePinnedExtendTx(
         operationData.pinnedExtendTxs = {};
 
     let pin: PinnedExtendTx | undefined = operationData.pinnedExtendTxs[operation.ref];
-    if (pin && shouldRepinPinnedExtend(operationData, pin, snapshot.anchorLedger)) {
+    if (pin && shouldRepinPinnedExtend(operationData, pin, snapshot.anchorLedger, operation.ref)) {
         delete operationData.pinnedExtendTxs[operation.ref];
         pin = undefined;
     }

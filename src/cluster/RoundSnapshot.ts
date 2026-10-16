@@ -38,7 +38,7 @@ function deepFreeze<T>(obj: T): T {
 }
 
 export function computeAnchorLedger(operationData: OperationData): number {
-    let cap = operationData.anchorLedger ?? 0;
+    let cap = operationData.anchorLedger !== undefined ? operationData.anchorLedger : 0;
     for (const op of operationData.operations) {
         const data = op.data as ExtendNodeOperation & { acquireLedgerCap?: number; signerTxCap?: number };
         if (typeof data.acquireLedgerCap === 'number')

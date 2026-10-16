@@ -7,7 +7,6 @@ import { ClusterManager } from "../cluster";
 import {
     MAX_OPERATION_ATTEMPTS,
     MAX_OPS_PER_ROUND,
-    backoffLcl,
     isHeldOperationType,
     isOperationComplete,
     operationAttempt,
@@ -89,10 +88,14 @@ class ClusterContext {
             await this.#bootstrapQueueState();
             const config = await this.hpContext.getContractConfig();
             const evernodeCfg = (config as { evernode?: { anchorLedger?: number; tenantSequence?: number } }).evernode;
-            const anchor = this.operationData.anchorLedger ?? evernodeCfg?.anchorLedger;
-            if (!anchor || anchor <= 0) {
-                this.roundAborted = true;
-                return;
+            let anchor = this.operationData.anchorLedger;
+            if (anchor === undefined || anchor <= 0) {
+                const bootAnchor = evernodeCfg?.anchorLedger;
+                if (bootAnchor === undefined || bootAnchor <= 0) {
+                    this.roundAborted = true;
+                    return;
+                }
+                anchor = bootAnchor;
             }
             if (this.operationData.agreedTenantSequence === undefined && evernodeCfg?.tenantSequence === undefined) {
                 this.roundAborted = true;
@@ -208,7 +211,9 @@ class ClusterContext {
         if (!tenantAddress)
             throw new Error('Missing tenant address for queue snapshot');
 
-        const anchor = this.operationData.anchorLedger ?? evernodeCfg.anchorLedger;
+        let anchor = this.operationData.anchorLedger;
+        if (anchor === undefined || anchor <= 0)
+            anchor = evernodeCfg.anchorLedger;
         if (anchor === undefined || anchor <= 0)
             throw new Error('Missing anchorLedger in agreed operation or contract state');
 
@@ -314,13 +319,14 @@ class ClusterContext {
             if (snapNode && snapNode.lifeMoments < snapNode.targetLifeMoments)
                 this.clusterManager.increaseLifeMoments(data.nodePubkey, data.moments);
             const pin = getPinnedExtendTx(this.operationData, operation.ref);
-            const seq = pin?.sequence ?? readTenantSequence(snapshot);
+            const seq = pin !== undefined ? pin.sequence : readTenantSequence(snapshot);
             if (!this.operationData.consumedTenantSequences)
                 this.operationData.consumedTenantSequences = [];
             if (!this.operationData.consumedTenantSequences.includes(seq))
                 this.operationData.consumedTenantSequences.push(seq);
-            const agreed = this.operationData.agreedTenantSequence ?? seq;
-            if (seq >= agreed)
+            const agreed = this.operationData.agreedTenantSequence;
+            const agreedBaseline = agreed !== undefined ? agreed : seq;
+            if (seq >= agreedBaseline)
                 this.operationData.agreedTenantSequence = seq + 1;
             clearPinnedExtendTx(this.operationData, operation.ref);
             this.updatedData = true;
@@ -355,9 +361,13 @@ class ClusterContext {
             return 'skipped';
 
         const tenantAddress = snapshot.tenantAddress;
+        const validatedIndex = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
+        const sequenceLedgerIndex = validatedIndex > 0
+            ? Math.min(snapshot.anchorLedger, validatedIndex)
+            : snapshot.anchorLedger;
         const onLedgerSeq = await this.evernodeContext.xrplContext.getAccountSequenceAtForObservation(
             tenantAddress,
-            snapshot.anchorLedger,
+            sequenceLedgerIndex,
         );
         if (onLedgerSeq === null || onLedgerSeq > seq)
             return 'skipped';
@@ -436,28 +446,9 @@ class ClusterContext {
             }
 
             try {
-                const outcome = await this.#performExtendOperation(operation, snapshot);
-                if (outcome === 'submitted') {
-                    const attempt = operationAttempt(operation) + 1;
-                    operation.attempt = attempt;
-                    delete operation.retryCount;
-                    operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
-                    delete operation.nextRetryLcl;
-                    this.updatedData = true;
-                }
+                await this.#performExtendOperation(operation, snapshot);
             } catch (e) {
-                const attempt = operationAttempt(operation) + 1;
-                operation.attempt = attempt;
-                delete operation.retryCount;
-                operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
-                delete operation.nextRetryLcl;
-                this.updatedData = true;
                 error(e);
-                if (attempt >= MAX_OPERATION_ATTEMPTS) {
-                    error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_ATTEMPTS} failed attempts.`);
-                    this.operationData.operations.splice(i, 1);
-                    this.updatedData = true;
-                }
             }
             actions++;
             break;
