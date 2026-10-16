@@ -179,6 +179,6 @@ describe('anchor observation consensus', () => {
                 })),
             }],
         });
-        assert.strictEqual(operationData.nodeUserRegistrations[userKeys.publicKey], unlPub);
+        assert.strictEqual(operationData.nodeUserRegistrations[userKeys.publicKey], unlKeys.publicKey);
     });
 });
