@@ -20,6 +20,8 @@ export interface ClusterNode extends AcquiredNode {
   status: NodeStatusInfo;
   activeOnLcl?: number;
   isUnl: boolean;
+  /** ADD operation ref when this node was promoted from a pending acquire. */
+  addOpRef?: string;
   signerAddress?: string;
   createdOnTimestamp?: number;
   lifeMoments: number;
@@ -33,6 +35,8 @@ export interface PendingNode extends PendingAcquire {
   targetLifeMoments: number;
   maxLifeMoments?: number;
   aliveCheckCount: number;
+  /** Operation queue ref for the ADD that created this pending acquire. */
+  opRef?: string;
 }
 
 export interface ClusterData {
@@ -55,27 +59,49 @@ export interface ClusterMessageResponse {
 export interface AddNodeOperation {
   acquireOptions: AcquireOptions;
   lifeMoments: number;
-  maxLifeMoments?: number
+  maxLifeMoments?: number;
+  acquireTxHash?: string;
+  acquireLedgerCap?: number;
+  leaseOfferIdx?: string;
+  host?: string;
+  /** Agreed message public key (prior round); not derived from lclHash. */
+  messagePublicKey?: string;
 }
 
 export interface ExtendNodeOperation {
   nodePubkey: string;
   moments: number;
+  extendTxHash?: string;
+  extendLedgerCap?: number;
 }
+
+export type RemoveNodeStep = 'SIGNER' | 'UNL' | 'PEER' | 'DONE';
 
 export interface RemoveNodeOperation {
   nodePubkey: string;
   force: boolean;
+  step?: RemoveNodeStep;
+  signerTxCap?: number;
+  newSignerAddress?: string;
 }
 
 export interface Operation {
   type: OperationType,
   ref: string,
-  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation
+  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation,
+  attempt?: number;
+  nextAttemptLcl?: number;
+  createdLcl?: number;
+  /** @deprecated migrated to attempt */
+  retryCount?: number;
+  /** @deprecated migrated to nextAttemptLcl */
+  nextRetryLcl?: number;
 }
 
 export interface OperationData {
-  operations: Operation[]
+  operations: Operation[];
+  anchorLedger?: number;
+  tenantSequence?: number;
 }
 
 export enum ClusterMessageType {

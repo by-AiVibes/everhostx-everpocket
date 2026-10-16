@@ -19,6 +19,9 @@ export interface PendingAcquire {
   refId: string;
   messageKey: string;
   acquireSentOnLcl: number;
+  /** Queue operation ref (op.ref); Evernode tx hash stays in refId. */
+  opRef?: string;
+  acquireLedgerCap?: number;
 }
 
 export interface AcquiredNode extends Instance {

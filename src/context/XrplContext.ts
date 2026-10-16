@@ -9,6 +9,10 @@ import VoteContext from './VoteContext';
 import { JSONHelpers } from '../utils';
 import { error, log } from '../helpers/logger';
 import NumberHelpers from '../utils/helpers/NumberHelper';
+import { XahauLedgerBackend } from '../ledger/XahauLedgerBackend';
+import { EVERNODE_XAHAU_NETWORK_KEY } from '../ledger/xahauConstants';
+import { FrozenRoundSnapshot } from '../cluster/RoundSnapshot';
+import { deriveFee, deriveLastLedgerSequence, deriveSequence } from '../cluster/DeterministicTx';
 
 const TIMEOUT = 10000;
 const TRANSACTION_VOTE_THRESHOLD = 0.5;
@@ -25,6 +29,8 @@ class XrplContext {
     public multiSigner!: MultiSigner;
     public voteContext: VoteContext;
     public contextOptions: XrplOptions;
+    /** Pinned-index Xahau reads (Evernode ledger); tests inject FakeXahauLedger. */
+    public xahauLedger: XahauLedgerBackend | null = null;
 
     public constructor(hpContext: HotPocketContext, address: string, secret: string | null = null, options: XrplOptions = {}) {
         this.hpContext = hpContext;
@@ -49,7 +55,19 @@ class XrplContext {
         if (this.initialized)
             return;
 
-        await evernode.Defaults.useNetwork(this.contextOptions.network || "mainnet");
+        await this.bootstrapForRound();
+        await this.reconcileValidatedTransactions(0);
+        this.initialized = true;
+    }
+
+    /**
+     * Connect and load signer list only (no validation side effects).
+     */
+    public async bootstrapForRound(): Promise<void> {
+        if (this.xrplApi?.isConnected?.())
+            return;
+
+        await evernode.Defaults.useNetwork(this.contextOptions.network || EVERNODE_XAHAU_NETWORK_KEY);
         this.xrplApi = this.xrplApi || new evernode.XrplApi(this.contextOptions.rippleServer, { autoReconnect: false, ...this.contextOptions });
         evernode.Defaults.set({
             xrplApi: this.xrplApi
@@ -59,17 +77,32 @@ class XrplContext {
 
         await this.xrplApi.connect();
         await this.loadSignerList();
+    }
+
+    /**
+     * Reconcile pending txs and local signer state (§4.1 — not in bare init).
+     */
+    public async reconcileValidatedTransactions(_anchorLedger: number): Promise<void> {
         this.#checkSignerValidity();
         await this.#checkForValidateTransactions();
-        this.initialized = true;
+    }
+
+    public deriveTxSubmitInfo(snap: FrozenRoundSnapshot): TransactionSubmissionInfo {
+        return {
+            sequence: deriveSequence(snap),
+            maxLedgerSequence: deriveLastLedgerSequence(snap),
+            fee: deriveFee(snap),
+        };
     }
 
     /**
      * Deinitialize the xrpl context.
      */
-    public async deinit(): Promise<void> {
-        this.#persistTransactionData();
-        await this.xrplApi.disconnect();
+    public async deinit(roundAborted: boolean = false): Promise<void> {
+        if (!roundAborted)
+            this.#persistTransactionData();
+        if (this.xrplApi?.isConnected())
+            await this.xrplApi.disconnect();
     }
 
     /**
@@ -243,26 +276,35 @@ class XrplContext {
      * @returns Transaction submission info.
      */
     public async getTransactionSubmissionInfo(options: VoteElectorOptions = {}, decisionOptions: DecisionOptions | null = null): Promise<TransactionSubmissionInfo> {
-        let info = <TransactionSubmissionInfo>{
-            sequence: await this.getSequence(),
-            maxLedgerSequence: this.getMaxLedgerSequence(),
-        }
+        const sequence = await this.getSequence();
+        const localMaxLls = this.getMaxLedgerSequence();
 
-        if (decisionOptions)
-            info.options = decisionOptions;
-
-        // Decide a sequence number and max ledger sequence to send the same transaction from all the nodes.
-        const infos: TransactionSubmissionInfo[] = (await this.voteContext.vote(`transactionInfo${this.voteContext.getUniqueNumber()}`, [info], new AllVoteElector(this.hpContext.getContractUnl().length, options?.timeout || TIMEOUT))).map(ob => ob.data);
+        // Only LastLedgerSequence is elected; sequence is local account state on Xahau.
+        const llsBallots = (await this.voteContext.vote(
+            `transactionMaxLls${this.voteContext.getUniqueNumber()}`,
+            [{ maxLedgerSequence: localMaxLls }],
+            new AllVoteElector(this.hpContext.getContractUnl().length, options?.timeout || TIMEOUT),
+        )).map((ob) => ob.data.maxLedgerSequence as number);
 
         var res = <TransactionSubmissionInfo>{
-            sequence: infos.map(i => i.sequence).sort((a, b) => b - a)[0],
-            maxLedgerSequence: infos.map(i => i.maxLedgerSequence).sort((a, b) => b - a)[0]
+            sequence,
+            maxLedgerSequence: llsBallots.sort((a, b) => b - a)[0],
         };
 
-        const decisionOptionList = infos.filter(i => i.options).map(i => i.options).sort((a, b) => (a?.key.localeCompare(b?.key!) || 0));
-        if (decisionOptionList && decisionOptionList.length > 0) {
-            const randomIndex = NumberHelpers.getRandomNumber(this.hpContext, 0, decisionOptionList.length);
-            res.options = decisionOptionList[randomIndex];
+        if (decisionOptions) {
+            const electedInfos = (await this.voteContext.vote(
+                `transactionDecision${this.voteContext.getUniqueNumber()}`,
+                [<TransactionSubmissionInfo>{ sequence, maxLedgerSequence: res.maxLedgerSequence, options: decisionOptions }],
+                new AllVoteElector(this.hpContext.getContractUnl().length, options?.timeout || TIMEOUT),
+            )).map((ob) => ob.data);
+            const decisionOptionList = electedInfos
+                .filter((i) => i.options)
+                .map((i) => i.options!)
+                .sort((a, b) => a.key.localeCompare(b.key));
+            if (decisionOptionList.length > 0) {
+                const randomIndex = NumberHelpers.getRandomNumber(this.hpContext, 0, decisionOptionList.length);
+                res.options = decisionOptionList[randomIndex];
+            }
         }
 
         return res;
@@ -297,7 +339,10 @@ class XrplContext {
         if (!this.signerListInfo || !signerCount)
             throw `${transaction.TransactionType} | Could not get signer list`;
 
-        transaction.Fee = `${Number(transaction.Fee) * (signerCount + 2)}`;
+        if (txSubmitInfo.fee)
+            transaction.Fee = txSubmitInfo.fee;
+        else
+            transaction.Fee = `${Number(transaction.Fee) * (signerCount + 2)}`;
 
         const elector = new AllVoteElector(signerCount, options?.voteElectorOptions?.timeout || TIMEOUT);
         const electionName = `sign${this.voteContext.getUniqueNumber()}`;
@@ -569,18 +614,17 @@ class XrplContext {
      * @returns New signer address.
      */
     async replaceSignerList(oldSignerAddress: string, newSignerAddress: string, options: MultiSignOptions = {}): Promise<void> {
-        // Replace signer from the list and renew the signer list. Clone objet to avoid reference.
-        let signerListInfo = <SignerListInfo>{};
-        if (this.signerListInfo)
-            Object.assign(signerListInfo, this.signerListInfo);
-
-        if (!signerListInfo?.signerList)
+        if (!this.signerListInfo?.signerList)
             throw `Current signer list does not exist.`
 
-        // Remove signer from the list and renew the signer list.
-        const oldSignerIndex = signerListInfo.signerList.findIndex(s => s.account === oldSignerAddress);
+        const oldSignerIndex = this.signerListInfo.signerList.findIndex(s => s.account === oldSignerAddress);
         if (oldSignerIndex === -1)
-            throw `Could not find a old signer with given address.`
+            return;
+
+        const signerListInfo: SignerListInfo = {
+            signerQuorum: this.signerListInfo.signerQuorum,
+            signerList: this.signerListInfo.signerList.map(s => ({ account: s.account, weight: s.weight })),
+        };
 
         const newSignerIndex = signerListInfo.signerList.findIndex(s => s.account === newSignerAddress);
 
@@ -604,6 +648,32 @@ class XrplContext {
      */
     public getSignerList(): SignerListInfo | null {
         return this.signerListInfo;
+    }
+
+    public getValidatedLedgerIndex(): number {
+        if (this.xahauLedger)
+            return this.xahauLedger.getValidatedLedgerIndex();
+        return this.xrplApi?.ledgerIndex ?? 0;
+    }
+
+    public setXahauLedgerBackend(backend: XahauLedgerBackend | null): void {
+        this.xahauLedger = backend;
+    }
+
+    public async getTxAt(hash: string, ledgerIndex: number): Promise<TransactionInfo | null> {
+        if (ledgerIndex > 0 && this.getValidatedLedgerIndex() < ledgerIndex)
+            throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
+        if (this.xahauLedger)
+            return await this.xahauLedger.getTxAt(hash, ledgerIndex);
+        throw new Error(`Pinned Xahau read required for getTxAt(${hash}, ${ledgerIndex})`);
+    }
+
+    public async getSignerListAt(ledgerIndex: number): Promise<SignerListInfo | null> {
+        if (ledgerIndex > 0 && this.getValidatedLedgerIndex() < ledgerIndex)
+            throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
+        if (this.xahauLedger)
+            return await this.xahauLedger.getSignerListAt(ledgerIndex);
+        throw new Error(`Pinned Xahau read required for getSignerListAt(${ledgerIndex})`);
     }
 
     /**

@@ -1,0 +1,126 @@
+const { describe, it, beforeEach, afterEach } = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+
+const { OperationType } = require('../../dist/models/cluster');
+const { createWorkDir } = require('./test-workdir');
+const {
+    writeAcquiresFile,
+    writeClusterFiles,
+    defaultClusterNode,
+    buildClusterContext,
+    runClusterUntilSettled,
+    consensusContract,
+} = require('./cluster-test-helpers');
+
+const FIRST_REMOVE_PUBKEY = 'first_remove_in_queue_pubkey';
+const SECOND_REMOVE_PUBKEY = 'second_remove_in_queue_pubkey';
+
+describe('Operation queue order (FIFO among ready ops)', () => {
+    let tmpDir;
+    let originalCwd;
+
+    beforeEach(() => {
+        tmpDir = createWorkDir('evp-queue-order');
+        originalCwd = process.cwd();
+        process.chdir(tmpDir);
+        writeAcquiresFile();
+    });
+
+    afterEach(() => {
+        process.chdir(originalCwd);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('runs ADD before a later ready REMOVE (no aliveness deferral)', async () => {
+        const { deriveMessagePublicKey } = require('../../dist/cluster/DeterministicTx');
+        const addRef = 'add_first_in_queue';
+        const messagePublicKey = deriveMessagePublicKey({ anchorLedger: 1_000_000, tenantSequence: 1, lclSeqNo: 100 }, addRef);
+        let acquireCalls = 0;
+        const deferred = [];
+        writeClusterFiles({
+            nodes: [defaultClusterNode(SECOND_REMOVE_PUBKEY)],
+            pendingNodes: [],
+            operations: [
+                {
+                    type: OperationType.ADD_NODE,
+                    ref: addRef,
+                    data: { acquireOptions: {}, lifeMoments: 1, maxLifeMoments: 0, messagePublicKey },
+                },
+                {
+                    type: OperationType.REMOVE_NODE,
+                    ref: SECOND_REMOVE_PUBKEY,
+                    data: { nodePubkey: SECOND_REMOVE_PUBKEY, force: true },
+                },
+            ],
+        });
+
+        const ctx = buildClusterContext({
+            applyDeferredAcquireWrites: () => {
+                const data = JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
+                deferred.forEach((p) => data.pendingAcquires.push(p));
+                deferred.length = 0;
+                fs.writeFileSync('acquires.json', JSON.stringify(data));
+            },
+            acquireNodeFromSnapshot: async () => {
+                acquireCalls++;
+                const p = { refId: 'new_acquire_ref', host: 'host.example', opRef: addRef, leaseOfferIdx: '1', messageKey: 'mk', acquireSentOnLcl: 0, acquireLedgerCap: 999_000 };
+                deferred.push(p);
+                return p;
+            },
+        });
+
+        await ctx.init();
+        await ctx.deinit();
+        ctx.hpContext.lclSeqNo = 104;
+        await ctx.init();
+        await ctx.deinit();
+
+        assert.strictEqual(acquireCalls, 1);
+
+        const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.strictEqual(ops.operations.length, 2);
+        assert.strictEqual(ops.operations[0].type, OperationType.ADD_NODE);
+        assert.ok((ops.operations[0].attempt ?? ops.operations[0].retryCount ?? 0) >= 1);
+        assert.strictEqual(ops.operations[1].type, OperationType.REMOVE_NODE);
+        assert.strictEqual(ops.operations[1].ref, SECOND_REMOVE_PUBKEY);
+
+        const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
+        assert.ok(cluster.nodes.some((n) => n.pubkey === SECOND_REMOVE_PUBKEY));
+        const acquires = JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
+        assert.ok(acquires.pendingAcquires.some((p) => p.opRef === addRef));
+    });
+
+    it('runs the first queued REMOVE before a later ready REMOVE', async () => {
+        writeClusterFiles({
+            nodes: [
+                defaultClusterNode(FIRST_REMOVE_PUBKEY),
+                defaultClusterNode(SECOND_REMOVE_PUBKEY),
+            ],
+            pendingNodes: [],
+            operations: [
+                {
+                    type: OperationType.REMOVE_NODE,
+                    ref: FIRST_REMOVE_PUBKEY,
+                    data: { nodePubkey: FIRST_REMOVE_PUBKEY, force: true },
+                },
+                {
+                    type: OperationType.REMOVE_NODE,
+                    ref: SECOND_REMOVE_PUBKEY,
+                    data: { nodePubkey: SECOND_REMOVE_PUBKEY, force: true },
+                },
+            ],
+        });
+
+        const { hpOverrides } = consensusContract([FIRST_REMOVE_PUBKEY, SECOND_REMOVE_PUBKEY]);
+        await runClusterUntilSettled({}, { ...hpOverrides }, 30);
+
+        const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.ok(ops.operations.length <= 1);
+        if (ops.operations.length === 1)
+            assert.strictEqual(ops.operations[0].ref, SECOND_REMOVE_PUBKEY);
+
+        const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
+        assert.ok(!cluster.nodes.some((n) => n.pubkey === FIRST_REMOVE_PUBKEY));
+    });
+});

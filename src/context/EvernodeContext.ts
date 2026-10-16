@@ -6,11 +6,21 @@ import { AllVoteElector } from "../vote/vote-electors";
 import { URIToken } from "../models";
 import * as fs from 'fs';
 import * as kp from 'ripple-keypairs';
+import { createHash } from 'crypto';
 import { JSONHelpers } from "../utils";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
 import { error, log } from "../helpers/logger";
 import NumberHelpers from "../utils/helpers/NumberHelper";
+import { FrozenRoundSnapshot } from "../cluster/RoundSnapshot";
+import { AddNodeOperation } from "../models/cluster";
+import {
+    acquireTxCanonicalFields,
+    computeAcquireTxHash,
+    deriveHost,
+    deriveMessageKeypair,
+    deriveLastLedgerSequence,
+} from "../cluster/DeterministicTx";
 
 const TIMEOUT = 10000;
 const ACQUIRE_ABANDON_LCL_THRESHOLD = 10;
@@ -18,6 +28,7 @@ const ACQUIRE_ABANDON_LCL_THRESHOLD = 10;
 class EvernodeContext {
     private acquireDataFile: string = "acquires.json";
     private acquireData: AcquireData = { acquiredNodes: [], pendingAcquires: [] };
+    private deferredPendingAcquires: PendingAcquire[] = [];
     private registryClient: any;
     private updatedData: boolean = false;
     private initialized: boolean = false;
@@ -48,28 +59,39 @@ class EvernodeContext {
         if (this.initialized)
             return;
 
-        await this.xrplContext.init();
+        await this.bootstrapForRound();
+        await this.finishRoundInit();
+        this.initialized = true;
+    }
 
-        try {
+    public async bootstrapForRound(): Promise<void> {
+        await this.xrplContext.bootstrapForRound();
+    }
+
+    public async finishRoundInit(): Promise<void> {
+        if (!this.registryClient) {
             this.registryClient = await evernode.HookClientFactory.create(evernode.HookTypes.registry);
             await this.registryClient.connect();
-
-            await this.#checkForCompletedAcquires();
-            this.initialized = true;
-        } catch (e) {
-            await this.deinit();
-            throw e;
         }
+        await this.#checkForCompletedAcquires();
+    }
+
+    public applyDeferredAcquireWrites(): void {
+        for (const p of this.deferredPendingAcquires)
+            this.#updatePendingAcquireInfo(p);
+        this.deferredPendingAcquires = [];
     }
 
     /**
      * Deinitialize the context.
      */
-    public async deinit(): Promise<void> {
-        this.#persistAcquireData();
+    public async deinit(roundAborted: boolean = false): Promise<void> {
+        if (!roundAborted)
+            this.#persistAcquireData();
         if (this.registryClient)
             await this.registryClient.disconnect();
-        await this.xrplContext.deinit();
+        this.registryClient = null as any;
+        await this.xrplContext.deinit(roundAborted);
         this.initialized = false;
     }
 
@@ -156,7 +178,16 @@ class EvernodeContext {
                 remove = true;
             }
             // Abandon waiting for this node if threshold reached.
-            else if (item.acquireSentOnLcl < (this.hpContext.lclSeqNo - ACQUIRE_ABANDON_LCL_THRESHOLD)) {
+            else if (item.acquireLedgerCap
+                && this.xrplContext.getValidatedLedgerIndex() >= item.acquireLedgerCap) {
+                const tx = await this.xrplContext.getTxAt(item.refId, item.acquireLedgerCap);
+                if (!tx || tx.resultCode !== 'tesSUCCESS') {
+                    log(`Acquire ${item.refId} failed or missing at cap ${item.acquireLedgerCap}; abandoning pending.`);
+                    remove = true;
+                }
+            }
+            else if (!item.acquireLedgerCap
+                && item.acquireSentOnLcl < (this.hpContext.lclSeqNo - ACQUIRE_ABANDON_LCL_THRESHOLD)) {
                 log(`Maximum acquire wait threshold reached, Abandoning waiting for ${item.refId}.`);
                 remove = true;
             }
@@ -212,7 +243,85 @@ class EvernodeContext {
      * @param options Options related to a particular acquire operation.
      * @returns Acquire data.
      */
-    public async acquireNode(options: AcquireOptions = {}): Promise<PendingAcquire> {
+    public getAcquireDataSnapshot(): AcquireData {
+        return JSON.parse(JSON.stringify(this.acquireData));
+    }
+
+    public async acquireNodeFromSnapshot(
+        snap: FrozenRoundSnapshot,
+        opRef: string,
+        options: AcquireOptions = {},
+    ): Promise<PendingAcquire> {
+        const snapOp = snap.operations.find((o) => o.ref === opRef);
+        const snapData = snapOp?.data as AddNodeOperation | undefined;
+        const messagePublicKey = snapData?.messagePublicKey;
+        if (!messagePublicKey)
+            throw new Error('ADD perform blocked: messagePublicKey not in round snapshot');
+
+        const hostAddress = deriveHost(snap, opRef);
+        const leaseOfferIdx = snapData?.leaseOfferIdx || '1';
+        const keypair = deriveMessageKeypair(snap, opRef);
+        const keyPath = `../${messagePublicKey}.txt`;
+        if (!fs.existsSync(keyPath))
+            fs.writeFileSync(keyPath, keypair.privateKey);
+
+        const txSubmitInfo = this.xrplContext.deriveTxSubmitInfo(snap);
+        const leaseOffer = { index: leaseOfferIdx } as URIToken;
+        const res = await this.acquireSubmitDeterministic(
+            hostAddress,
+            leaseOffer,
+            messagePublicKey,
+            options,
+            snap,
+            opRef,
+            txSubmitInfo,
+        );
+
+        const canonical = acquireTxCanonicalFields(snap, opRef, messagePublicKey);
+        const refId = res?.hash || computeAcquireTxHash(canonical, leaseOfferIdx);
+        const pendingAcquire = <PendingAcquire>{
+            host: hostAddress,
+            leaseOfferIdx,
+            refId,
+            messageKey: messagePublicKey,
+            acquireSentOnLcl: snap.lclSeqNo,
+            opRef,
+            acquireLedgerCap: res?.lastLedgerSequence ?? res?.LastLedgerSequence ?? deriveLastLedgerSequence(snap),
+        };
+
+        this.deferredPendingAcquires.push(pendingAcquire);
+        return pendingAcquire;
+    }
+
+    public async acquireSubmitDeterministic(
+        hostAddress: string,
+        leaseOffer: URIToken,
+        messagePublicKey: string,
+        options: AcquireOptions,
+        snap: FrozenRoundSnapshot,
+        opRef: string,
+        txSubmitInfo: { sequence: number; maxLedgerSequence: number; fee?: string },
+    ): Promise<any> {
+        const tenantClient = new evernode.TenantClient(this.xrplContext.xrplAcc.address);
+        await tenantClient.connect();
+
+        const ivSeed = createHash('sha256')
+            .update(`everpocket-acquire-iv|${opRef}|${snap.anchorLedger}|${snap.tenantSequence}`)
+            .digest();
+        const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(
+            hostAddress,
+            { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messagePublicKey },
+            { leaseOfferIndex: leaseOffer.index, iv: ivSeed.slice(0, 16), ephemPrivateKey: ivSeed.slice(0, 32) },
+        );
+        await tenantClient.disconnect();
+
+        return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, {
+            ...options,
+            txSubmitInfo,
+        });
+    }
+
+    public async acquireNode(options: AcquireOptions = {}, opRef?: string): Promise<PendingAcquire> {
         // Use provided host or select a host randomly.
         const hostAddress = options.host || await this.decideHost(options.preferredHosts);
         // Choose the lease offer
@@ -231,7 +340,9 @@ class EvernodeContext {
             leaseOfferIdx: leaseOffer.index,
             refId: res.hash,
             messageKey: messageKey,
-            acquireSentOnLcl: this.hpContext.lclSeqNo
+            acquireSentOnLcl: this.hpContext.lclSeqNo,
+            opRef,
+            acquireLedgerCap: res.LastLedgerSequence ?? res.lastLedgerSequence,
         };
 
         // Record as a acquire transaction.
@@ -255,6 +366,14 @@ class EvernodeContext {
      * @param acquireRefId Acquire reference.
      * @returns Pending node.
      */
+    public getLeaseStateAt(acquireRefId: string): 'acquired' | 'pending' | 'unknown' {
+        if (this.getIfAcquired(acquireRefId))
+            return 'acquired';
+        if (this.getIfPending(acquireRefId))
+            return 'pending';
+        return 'unknown';
+    }
+
     public getIfPending(acquireRefId: string): PendingAcquire | null {
         const node = this.acquireData.pendingAcquires.find(n => n.refId == acquireRefId);
         return node ? node : null;
@@ -309,16 +428,16 @@ class EvernodeContext {
 
         const electionName = `message_key_selection${this.voteContext.getUniqueNumber()}`;
         const voteRound = this.voteContext.vote(electionName, [keyPair.publicKey], new AllVoteElector(this.hpContext.getContractUnl().length, options?.timeout || TIMEOUT));
-        let collection = (await voteRound).map((v) => v.data);
+        const collection = (await voteRound).map((v) => v.data);
 
-        let sortCollection = collection.sort((a, b) => a.localeCompare(b));
+        const sortCollection = [...collection].sort((a, b) => a.localeCompare(b));
 
         if (sortCollection[0] === keyPair.publicKey) {
             fs.writeFileSync(`../${keyPair.publicKey}.txt`, keyPair.privateKey);
             log("Wrote Key file.");
         }
 
-        return collection[0];
+        return sortCollection[0];
     }
 
     /**
