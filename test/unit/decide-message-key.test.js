@@ -1,3 +1,5 @@
+// Regression pin for PR #36 / fix 3. On 06ba9f5 this is a no-op: in-place collection.sort()
+// already makes collection[0] the lexicographic winner; kept for clarity and upstream alignment.
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
@@ -5,7 +7,7 @@ const fs = require('fs');
 const { EvernodeContext } = require('../../dist');
 const { createWorkDir } = require('./test-workdir');
 
-describe('Fix 3: decideMessageKey', () => {
+describe('decideMessageKey regression pin (no-op vs 06ba9f5)', () => {
     let tmpDir;
     let originalCwd;
 

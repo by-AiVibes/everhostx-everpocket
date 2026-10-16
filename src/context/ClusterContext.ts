@@ -139,7 +139,7 @@ class ClusterContext {
     }
 
     /**
-     * Process operations one by one at each execution.
+     * First queued operation that may run this round (FIFO among eligible ops).
      * @param deferAdd When true, skip ADD_NODE ops this round (pending aliveness probe).
      */
     #findProcessableOperationIndex(deferAdd: boolean, curLcl: number): number {
@@ -154,6 +154,9 @@ class ClusterContext {
         return -1;
     }
 
+    /**
+     * Process operations one by one at each execution.
+     */
     async #processOperations(deferAdd: boolean = false) {
         if (this.operationData.operations.length === 0)
             return;
