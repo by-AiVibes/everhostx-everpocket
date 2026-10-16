@@ -409,13 +409,8 @@ class ClusterContext {
                 } catch (e) {
                     error(e);
                 }
-                this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
+                await this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
             }
-<<<<<<< HEAD
-            await this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
-        }
-=======
->>>>>>> dba3e74 (Batch 2: configurable prune thresholds and parallel ops per round)
 
             if (touchesSigner && !completeInAgreedState)
                 signerRemovesUsed++;

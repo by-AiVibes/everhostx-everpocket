@@ -175,6 +175,60 @@ describe('Fix 2: parallel ops per round', () => {
         assert.strictEqual(ops.operations[1].retryCount || 0, 0);
     });
 
+    it('P15: agreed-state dequeue does not consume the signer REMOVE slot', async () => {
+        const removeNodeAttempts = [];
+        const originalRemoveNode = ClusterManager.prototype.removeNode;
+        ClusterManager.prototype.removeNode = function (pubkey) {
+            removeNodeAttempts.push(pubkey);
+            return originalRemoveNode.call(this, pubkey);
+        };
+        let replaceCalls = 0;
+        const signerList = {
+            signerQuorum: 2,
+            signerList: [
+                { account: SIGNER_ADDR_A, weight: 1 },
+                { account: SIGNER_ADDR_B, weight: 1 },
+            ],
+        };
+        const { hpOverrides } = consensusContract(['helper', SIGNER_B]);
+        writeClusterFiles({
+            nodes: [
+                { ...defaultClusterNode('helper'), isUnl: true },
+                { ...defaultClusterNode(SIGNER_B), isUnl: true, signerAddress: SIGNER_ADDR_B },
+            ],
+            pendingNodes: [],
+            operations: [
+                { type: OperationType.REMOVE_NODE, ref: SIGNER_A, data: { nodePubkey: SIGNER_A, force: true } },
+                { type: OperationType.REMOVE_NODE, ref: SIGNER_B, data: { nodePubkey: SIGNER_B, force: true } },
+            ],
+        });
+        const ctx = buildClusterContext({
+            getIfAcquired: () => null,
+            getIfPending: () => false,
+        }, {
+            getContractUnl: () => [{ publicKey: 'helper' }, { publicKey: SIGNER_B }],
+            ...hpOverrides,
+        }, { maxOpsPerRound: 3 });
+        ctx.evernodeContext.xrplContext.getSignerList = () => signerList;
+        ctx.evernodeContext.xrplContext.replaceSignerList = async () => { replaceCalls++; };
+        ctx.evernodeContext.xrplContext.multiSigner = {
+            isSignerNode: () => false,
+            getSigner: () => null,
+            generateSigner: () => ({ account: 'rReplacement' }),
+        };
+        ctx.evernodeContext.xrplContext.getTransactionSubmissionInfo = async () => ({
+            options: { key: 'helper', options: { signerAddress: 'rReplacement' } },
+        });
+        try {
+            await ctx.init();
+            await ctx.deinit();
+        } finally {
+            ClusterManager.prototype.removeNode = originalRemoveNode;
+        }
+        assert.deepStrictEqual(removeNodeAttempts, [SIGNER_B]);
+        assert.strictEqual(replaceCalls, 1);
+    });
+
     it('retains failed ADD operations when maxOpsPerRound processes multiple ADDs', async () => {
         let acquireCalls = 0;
         writeClusterFiles({
