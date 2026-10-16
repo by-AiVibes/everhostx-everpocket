@@ -53,9 +53,9 @@ class ClusterContext {
         this.hpContext = this.evernodeContext.hpContext;
         this.voteContext = this.evernodeContext.voteContext;
         this.clusterManager = new ClusterManager();
-        this.maturityLclThreshold = options.maturityLclThreshold ?? MATURITY_LCL_THRESHOLD;
-        this.acknowledgeLclThreshold = options.acknowledgeLclThreshold ?? ACKNOWLEDGE_LCL_THRESHOLD;
-        this.acknowledgeRetryLclThreshold = options.acknowledgeRetryLclThreshold ?? ACKNOWLEDGE_RETRY_LCL_THRESHOLD;
+        this.maturityLclThreshold = options.maturityLclThreshold || MATURITY_LCL_THRESHOLD;
+        this.acknowledgeLclThreshold = options.acknowledgeLclThreshold || ACKNOWLEDGE_LCL_THRESHOLD;
+        this.acknowledgeRetryLclThreshold = options.acknowledgeLclThreshold || ACKNOWLEDGE_RETRY_LCL_THRESHOLD;
         const maxOpsPerRound = options.maxOpsPerRound ?? 1;
         if (maxOpsPerRound < 1)
             throw 'maxOpsPerRound must be at least 1';
@@ -417,7 +417,7 @@ class ClusterContext {
 =======
 >>>>>>> dba3e74 (Batch 2: configurable prune thresholds and parallel ops per round)
 
-            if (touchesSigner)
+            if (touchesSigner && !completeInAgreedState)
                 signerRemovesUsed++;
 
             info(`Operations processor ended.`);

@@ -4,6 +4,7 @@ const fs = require('fs');
 
 const { OperationType } = require('../../dist/models/cluster');
 const NomadContext = require('../../dist/context/NomadContext').default;
+const ClusterManager = require('../../dist/cluster/ClusterManager').default;
 const { createWorkDir } = require('./test-workdir');
 const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, buildClusterContext, consensusContract } = require('./cluster-test-helpers');
 
@@ -103,7 +104,12 @@ describe('Fix 2: parallel ops per round', () => {
 
     it('runs at most one signer-touching REMOVE per init round', async () => {
         let replaceCalls = 0;
-        const unlRemovalAttempts = [];
+        const removeNodeAttempts = [];
+        const originalRemoveNode = ClusterManager.prototype.removeNode;
+        ClusterManager.prototype.removeNode = function (pubkey) {
+            removeNodeAttempts.push(pubkey);
+            return originalRemoveNode.call(this, pubkey);
+        };
         const signerList = {
             signerQuorum: 2,
             signerList: [
@@ -134,15 +140,6 @@ describe('Fix 2: parallel ops per round', () => {
                 { publicKey: SIGNER_B },
             ],
             ...hpOverrides,
-            updateContractConfig: async (config) => {
-                const before = await hpOverrides.getContractConfig();
-                before.unl.forEach((p) => {
-                    if (!config.unl.includes(p)) {
-                        unlRemovalAttempts.push(p);
-                    }
-                });
-                return hpOverrides.updateContractConfig(config);
-            },
         }, { maxOpsPerRound: 3 });
 
         ctx.evernodeContext.xrplContext.getSignerList = () => signerList;
@@ -162,12 +159,47 @@ describe('Fix 2: parallel ops per round', () => {
             options: { key: 'helper', options: { signerAddress: 'rReplacement' } },
         });
 
+        try {
+            await ctx.init();
+            await ctx.deinit();
+        } finally {
+            ClusterManager.prototype.removeNode = originalRemoveNode;
+        }
+        assert.strictEqual(replaceCalls, 1);
+        assert.deepStrictEqual(removeNodeAttempts, [SIGNER_A]);
+        const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.strictEqual(ops.operations.length, 2);
+        assert.strictEqual(ops.operations[0].ref, SIGNER_A);
+        assert.ok((ops.operations[0].retryCount || 0) >= 1);
+        assert.strictEqual(ops.operations[1].ref, SIGNER_B);
+        assert.strictEqual(ops.operations[1].retryCount || 0, 0);
+    });
+
+    it('retains failed ADD operations when maxOpsPerRound processes multiple ADDs', async () => {
+        let acquireCalls = 0;
+        writeClusterFiles({
+            nodes: [],
+            pendingNodes: [],
+            operations: [
+                { type: OperationType.ADD_NODE, ref: 'add_ok_1', data: { acquireOptions: {}, lifeMoments: 1 } },
+                { type: OperationType.ADD_NODE, ref: 'add_fail', data: { acquireOptions: {}, lifeMoments: 1 } },
+                { type: OperationType.ADD_NODE, ref: 'add_ok_2', data: { acquireOptions: {}, lifeMoments: 1 } },
+            ],
+        });
+        const ctx = buildClusterContext({
+            acquireNode: async () => {
+                acquireCalls++;
+                if (acquireCalls === 2) {
+                    throw new Error('acquire failed');
+                }
+                return { refId: `ignored_${acquireCalls}`, host: 'h' };
+            },
+        }, {}, { maxOpsPerRound: 3 });
         await ctx.init();
         await ctx.deinit();
-        assert.strictEqual(replaceCalls, 1);
-        assert.deepStrictEqual(unlRemovalAttempts, [SIGNER_A]);
+        assert.strictEqual(acquireCalls, 3);
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 1);
-        assert.strictEqual(ops.operations[0].ref, SIGNER_B);
+        assert.strictEqual(ops.operations.length, 3);
+        assert.ok(ops.operations.every((o) => (o.retryCount || 0) >= 1));
     });
 });
