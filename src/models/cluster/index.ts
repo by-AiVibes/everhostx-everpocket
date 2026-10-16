@@ -86,8 +86,14 @@ export interface Operation {
 
 export interface OperationData {
   operations: Operation[];
-  /** Agreed Xahau ledger anchor; advances only on agreed EXTEND completion (see docs/queue-agreed-state.md). */
+  /** Agreed Xahau ledger anchor; advances via consensus observation quorum (see docs/queue-agreed-state.md). */
   anchorLedger?: number;
+  agreedLedgerHash?: string;
+  agreedTenantSequence?: number;
+  agreedSignerListHash?: string;
+  agreedExtendResults?: Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }>;
+  nodeUserRegistrations?: Record<string, string>;
+  observationDedup?: Record<string, { nonce: number; observedLcl: number }>;
 }
 
 export enum ClusterMessageType {

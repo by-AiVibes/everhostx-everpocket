@@ -14,13 +14,14 @@ import {
     operationNextAttemptLcl,
 } from "../cluster/OperationQueueProcessor";
 import { FrozenRoundSnapshot, RoundSnapshot } from "../cluster/RoundSnapshot";
-import { buildLastLedgerSequenceFromSnapshot, computeExtendTxHash, pickHostForOpRef } from "../cluster/DeterministicTx";
+import { computeExtendTxHash, pickHostForOpRef } from "../cluster/DeterministicTx";
 import { extendLastLedgerSequence } from "../cluster/OperationQueueProcessor";
 import { AllVoteElector } from "../vote/vote-electors";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
 import { error, info, log } from "../helpers/logger";
 import { JSONHelpers } from "../utils";
+import { applyObservationInputs, parseAnchorUserMessage, ANCHOR_OBSERVATION_MESSAGE_TYPE, NODE_USER_REGISTER_MESSAGE_TYPE } from "../cluster/AnchorObservation";
 const DUMMY_OWNER_PUBKEY = "dummy_owner_pubkey";
 const SASHIMONO_NODEJS_IMAGE = "evernodedev/sashimono:hp.0.6.4-ubt.20.04-njs.20";
 const ALIVENESS_CHECK_THRESHOLD = 5;
@@ -76,8 +77,7 @@ class ClusterContext {
         try {
             await this.evernodeContext.bootstrapForRound();
             const snapshot = await this.#captureRoundSnapshot();
-            const validatedXahau = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
-            if (snapshot.anchorLedger <= 0 || validatedXahau < snapshot.anchorLedger) {
+            if (snapshot.anchorLedger <= 0) {
                 this.roundAborted = true;
                 return;
             }
@@ -117,6 +117,51 @@ class ClusterContext {
         return this.roundAborted;
     }
 
+    /**
+     * Ingest HotPocket consensus user inputs (observations) before queue processing.
+     * Uses the submitting user's public key as identity (preferred: same as UNL node key).
+     */
+    public async ingestUserInput(user: User, msg: Buffer): Promise<ClusterMessageResponse | void> {
+        const parsed = parseAnchorUserMessage(msg);
+        if (parsed && (parsed.type === ANCHOR_OBSERVATION_MESSAGE_TYPE || parsed.type === NODE_USER_REGISTER_MESSAGE_TYPE)) {
+            const config = await this.hpContext.getContractConfig();
+            const maxOffset = config.max_input_ledger_offset ?? 0;
+            applyObservationInputs({
+                operationData: this.operationData,
+                contractUnl: config.unl,
+                currentLcl: this.hpContext.lclSeqNo,
+                maxInputLedgerOffset: maxOffset,
+                messages: [{ userPublicKey: user.publicKey, payload: msg }],
+            });
+            this.updatedData = true;
+            return;
+        }
+        return this.feedUserMessage(user, msg);
+    }
+
+    public async processConsensusUserInputs(contractUsers: {
+        list(): { publicKey: string; inputs: [number, number][] }[];
+        read(input: [number, number]): Promise<Buffer>;
+    }): Promise<void> {
+        const config = await this.hpContext.getContractConfig();
+        const maxOffset = config.max_input_ledger_offset ?? 0;
+        const messages: { userPublicKey: string; payload: Buffer }[] = [];
+        for (const user of contractUsers.list()) {
+            for (const input of user.inputs) {
+                const buf = await contractUsers.read(input);
+                messages.push({ userPublicKey: user.publicKey, payload: buf });
+            }
+        }
+        if (applyObservationInputs({
+            operationData: this.operationData,
+            contractUnl: config.unl,
+            currentLcl: this.hpContext.lclSeqNo,
+            maxInputLedgerOffset: maxOffset,
+            messages,
+        }).length >= 0)
+            this.updatedData = true;
+    }
+
     #ledgerReader() {
         return this.evernodeContext.xrplContext;
     }
@@ -139,9 +184,14 @@ class ClusterContext {
             ? await this.evernodeContext.xrplContext.getSignerListAt(anchor)
             : null;
 
-        const tenantSequence = anchor > 0 && validated >= anchor
-            ? await this.evernodeContext.xrplContext.getAccountSequenceAt(tenantAddress, anchor)
-            : 0;
+        let tenantSequence = 0;
+        if (anchor > 0 && validated >= anchor) {
+            if (this.operationData.agreedTenantSequence !== undefined
+                && this.operationData.anchorLedger === anchor)
+                tenantSequence = this.operationData.agreedTenantSequence;
+            else
+                tenantSequence = await this.evernodeContext.xrplContext.getAccountSequenceAt(tenantAddress, anchor);
+        }
 
         const operationDataCopy = JSON.parse(JSON.stringify(this.operationData));
         const preSnap = {
@@ -179,9 +229,16 @@ class ClusterContext {
             });
             const hash = computeExtendTxHash(snapForHash, op);
             const lls = extendLastLedgerSequence(snapForHash);
-            const tx = validated >= lls
+            const agreed = this.operationData.agreedExtendResults?.[op.ref];
+            let tx = validated >= lls
                 ? await this.evernodeContext.xrplContext.getTxAt(hash, lls)
                 : null;
+            if (!tx && agreed && agreed.hash === hash && agreed.resultCode === 'tesSUCCESS')
+                tx = {
+                    hash: agreed.hash,
+                    resultCode: agreed.resultCode,
+                    lastLedgerSequence: agreed.lastLedgerSequence,
+                };
             extendLedgerChecks.push({ ref: op.ref, hash, lastLedgerSequence: lls, tx });
         }
 
@@ -199,11 +256,6 @@ class ClusterContext {
             hostList: evernodeCfg.hosts,
             extendLedgerChecks,
         });
-    }
-
-    #advanceAgreedAnchor(snapshot: FrozenRoundSnapshot): void {
-        this.operationData.anchorLedger = buildLastLedgerSequenceFromSnapshot(snapshot);
-        this.updatedData = true;
     }
 
     /**
@@ -303,8 +355,6 @@ class ClusterContext {
                 await this.#onOperationDequeued(operation, snapshot);
                 this.operationData.operations.splice(i, 1);
                 this.updatedData = true;
-                if (operation.type === OperationType.EXTEND_NODE)
-                    this.#advanceAgreedAnchor(snapshot);
                 actions++;
                 break;
             }

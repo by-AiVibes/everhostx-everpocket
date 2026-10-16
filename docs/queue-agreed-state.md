@@ -1,23 +1,33 @@
 # Queue agreed state (Phase 1)
 
-Phase 1 does **not** use votes for queue tx fields. Agreed inputs come from HotPocket consensus state plus **pinned Xahau reads** at a shared ledger index.
+Phase 1 does **not** use NPL votes for anchor or queue tx fields. Agreed inputs come from HotPocket **consensus user inputs** plus **pinned Xahau reads** at the agreed anchor index.
+
+## Identity (client-input observations)
+
+- Each UNL node submits observations **out-of-band** via `hotpocket-js-client` `submitContractInput`, using **`HotPocketContext.submitContractInputRaw`** / **`ObservationSubmitter`** (same keys as the contract node — the HotPocket user public key matches the UNL key; see `HotPocketContext.#initClient`).
+- Fallback: a one-time `node_user_register` input signed by the UNL key maps a CSPRNG user public key to that UNL member (`nodeUserRegistrations` in `operations.json`). Keys are never derived from secrets.
+- Only inputs whose user public key resolves to a current UNL member are counted.
 
 ## `anchorLedger`
 
-- **Source of truth:** `operations.json` → `anchorLedger`, initially bootstrapped from the contract config field `evernode.anchorLedger` (same on all nodes via agreed HotPocket contract config).
-- **Advance rule (no vote, no local submit metadata):** when an EXTEND op is dequeued because the **deterministic** extend tx hash is `tesSUCCESS` on-ledger at the pinned anchor, all nodes set `operations.json.anchorLedger` to `anchorLedger + LLS_LEDGER_WINDOW` (30). Every node computes the same next anchor from the frozen round snapshot.
-- **Lag:** if a node’s validated Xahau index is `< anchorLedger`, the round aborts without persisting.
+- **Bootstrap:** `operations.json` → `anchorLedger`, initially from `evernode.anchorLedger` in agreed contract config.
+- **Advance rule:** deterministic quorum over the byte-identical consensus input set each round:
+  - Quorum = `ceil(2/3 × |UNL|)`.
+  - Among UNL observations passing dedupe and `max_input_ledger_offset`, pick anchor index via median / hash-quorum rule (`aggregateAnchorFromObservations` in `src/cluster/AnchorObservation.ts`).
+  - If quorum is missing, **do not advance**; EXTEND and the queue continue on the last agreed anchor.
+- **Lag:** validated Xahau behind the agreed anchor does **not** abort the round.
 
-## `tenantSequence` (Sequence field)
+## `tenantSequence` / signer-list hash
 
-- **Not stored in `operations.json`.**
-- **Source:** pinned `account_info` (or ledger backend equivalent) for the tenant address at `ledger_index = anchorLedger`. All nodes reading the same index see the same sequence.
+- When anchor advances via quorum, `agreedTenantSequence` and `agreedSignerListHash` are stored in `operations.json` from quorum-agreed observation fields at that anchor.
+- Round snapshot uses those values when present; otherwise pinned ledger reads at `anchorLedger`.
 
 ## Tx hash / completion
 
-- Extend tx hash is **recomputed** each round from the snapshot (`computeExtendTxHash`); it is **never** taken from a node’s submit response or written from perform/deinit.
-- Completion = hash present with `tesSUCCESS` at pinned `getTxAt(hash, lastLedgerSequence)` where `lastLedgerSequence = anchorLedger + 30` from the round snapshot (not from any node submit response).
+- Extend tx hash is **recomputed** each round (`computeExtendTxHash`); never taken from a local submit response.
+- Observations may carry `submittedTx` entries; quorum-agreed hashes land in `agreedExtendResults` and may satisfy completion when pinned ledger has not yet caught up.
+- Completion = `tesSUCCESS` at pinned `getTxAt` or matching quorum-agreed result for the deterministic hash.
 
 ## Host
 
-- Extend submit uses `pickHostForOpRef(snapshot, op.ref)` = `sha256(lclHash || opRef)` over the sorted agreed host list (not cluster node host fields).
+- Extend submit uses `pickHostForOpRef(snapshot, op.ref)` = `sha256(lclHash || opRef)` over the sorted agreed host list.

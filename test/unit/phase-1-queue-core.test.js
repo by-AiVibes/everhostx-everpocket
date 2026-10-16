@@ -109,7 +109,7 @@ describe('Phase 1 queue core', () => {
         assert.ok(!raw.includes('extendTxHash'));
     });
 
-    it('aborts round without persisting on Xahau lag', async () => {
+    it('continues round on Xahau lag using last agreed anchor', async () => {
         writeClusterFiles({
             nodes: [defaultClusterNode(EXTEND_PUBKEY)],
             operations: [{
@@ -124,7 +124,7 @@ describe('Phase 1 queue core', () => {
             },
         });
         await ctx.init();
-        assert.strictEqual(ctx.isRoundAborted(), true);
+        assert.strictEqual(ctx.isRoundAborted(), false);
         await ctx.deinit();
     });
 

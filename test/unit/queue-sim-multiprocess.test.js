@@ -8,6 +8,7 @@ const { spawn } = require('child_process');
 const { createWorkDir } = require('./test-workdir');
 const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, DEFAULT_ANCHOR, DEFAULT_TENANT_SEQUENCE, TENANT_ADDRESS } = require('./cluster-test-helpers');
 const { initLedger, readLedger, writeLedger, writePinnedRound, mergeSubmitIntents } = require('./shared-ledger-store');
+const { buildConsensusMessages } = require('./consensus-input-helpers');
 const { OperationType } = require('../../dist/models/cluster');
 
 const NODE_COUNT = 5;
@@ -123,6 +124,15 @@ describe('queue-sim multiprocess (phase 1)', () => {
                 });
 
                 const lcl = 100 + seed * 10 + round * 4;
+                const proposedAnchor = anchorForPin + 30;
+                fs.writeFileSync(path.join(seedRoot, `consensus-inputs-r${round}.json`), JSON.stringify({
+                    messages: buildConsensusMessages({
+                        validatedIndex: proposedAnchor,
+                        tenantSequence: DEFAULT_TENANT_SEQUENCE,
+                        observedLcl: lcl,
+                        nonce: round + 1,
+                    }),
+                }));
                 const results = [];
                 for (const d of dirs)
                     results.push(await runChild(seedRoot, d, seed, round, lcl));
@@ -140,5 +150,44 @@ describe('queue-sim multiprocess (phase 1)', () => {
                 mergeSubmitIntents(seedRoot, round);
             }
         }
+    });
+
+    it('lying minority (1 of 5) does not advance anchor via consensus inputs', async () => {
+        const seedRoot = path.join(workRoot, 'liar');
+        fs.mkdirSync(seedRoot, { recursive: true });
+        initLedger(seedRoot, {
+            anchor: DEFAULT_ANCHOR,
+            tenantSequence: DEFAULT_TENANT_SEQUENCE,
+            tenantAddress: TENANT_ADDRESS,
+        });
+        const dirs = seedNodeDirs(seedRoot);
+        const round = 0;
+        const lcl = 200;
+        const proposedAnchor = DEFAULT_ANCHOR + 30;
+        const honest = buildConsensusMessages({
+            validatedIndex: DEFAULT_ANCHOR,
+            tenantSequence: DEFAULT_TENANT_SEQUENCE,
+            observedLcl: lcl,
+        });
+        const liarPk = require('./consensus-input-helpers').unlPubkey(0);
+        const liarPayload = require('./consensus-input-helpers').buildConsensusMessages({
+            validatedIndex: proposedAnchor,
+            tenantSequence: DEFAULT_TENANT_SEQUENCE,
+            observedLcl: lcl,
+            liarNodeIndex: 0,
+        })[0].payload;
+        const messages = honest.map((m) => (m.userPublicKey === liarPk
+            ? { userPublicKey: liarPk, payload: liarPayload }
+            : m));
+        fs.writeFileSync(path.join(seedRoot, `consensus-inputs-r${round}.json`), JSON.stringify({ messages }));
+        writePinnedRound(seedRoot, round, {
+            anchor: DEFAULT_ANCHOR,
+            tenantAddress: TENANT_ADDRESS,
+            tenantSequence: DEFAULT_TENANT_SEQUENCE,
+        });
+        for (const d of dirs)
+            await runChild(seedRoot, d, 0, round, lcl);
+        const anchorAfter = JSON.parse(fs.readFileSync(path.join(seedRoot, 'n0', 'operations.json'), 'utf8')).anchorLedger;
+        assert.strictEqual(anchorAfter, DEFAULT_ANCHOR);
     });
 });

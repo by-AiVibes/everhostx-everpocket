@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { buildClusterContext, writeAcquiresFile, TENANT_ADDRESS } = require('./cluster-test-helpers');
+const { unlPubkey, fakeUsersCollection } = require('./consensus-input-helpers');
 const { ledgerBackendFromPinned } = require('./shared-ledger-store');
 const { computeExtendTxHash, buildLastLedgerSequence } = require('../../dist/cluster/DeterministicTx');
 const { RoundSnapshot } = require('../../dist/cluster/RoundSnapshot');
@@ -56,6 +57,11 @@ async function main() {
     const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
     const anchor = ops.anchorLedger;
 
+    const consensusPath = path.join(workRoot, `consensus-inputs-r${round}.json`);
+    const consensusBatch = fs.existsSync(consensusPath)
+        ? JSON.parse(fs.readFileSync(consensusPath, 'utf8'))
+        : null;
+
     const ctx = buildClusterContext({
         finishRoundInit: async () => {},
         extendSubmit: async () => {
@@ -93,11 +99,15 @@ async function main() {
         lclSeqNo: lcl,
         lclHash: process.env.EVP_LCL_HASH,
         getContractConfig: async () => ({
-            unl: [],
+            unl: [0, 1, 2, 3, 4].map((i) => unlPubkey(i)),
             evernode: { hosts: ['host.alpha', 'host.beta'], feeCeiling: '12000000', anchorLedger: anchor },
             consensus: { roundtime: 1000, stage_slice: 100 },
+            max_input_ledger_offset: 32,
         }),
     });
+
+    if (consensusBatch?.messages)
+        await ctx.processConsensusUserInputs(fakeUsersCollection(consensusBatch.messages));
 
     await ctx.init();
     const aborted = ctx.isRoundAborted();
