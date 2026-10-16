@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { FrozenRoundSnapshot } from './RoundSnapshot';
-import { ExtendNodeOperation, Operation } from '../models/cluster';
+import { ExtendNodeOperation, Operation, OperationData } from '../models/cluster';
 
 /** LastLedgerSequence window above agreed anchor ledger. */
 export const LLS_LEDGER_WINDOW = 30;
@@ -23,6 +23,25 @@ export function readFeeCeiling(snap: FrozenRoundSnapshot): string {
 
 export function readTenantSequence(snap: FrozenRoundSnapshot): number {
     return snap.tenantSequence;
+}
+
+/**
+ * Quorum-agreed tenant sequence advanced past the frozen round snapshot means the snapshot
+ * sequence is consumed. All nodes apply this the same way (no local ledger reads).
+ */
+export function syncConsumedTenantSequenceFromQuorum(
+    operationData: OperationData,
+    snapshot: FrozenRoundSnapshot,
+): boolean {
+    const snapSeq = readTenantSequence(snapshot);
+    const agreed = operationData.agreedTenantSequence;
+    if (agreed === undefined || agreed <= snapSeq)
+        return false;
+    if (!operationData.consumedTenantSequences)
+        operationData.consumedTenantSequences = [];
+    if (!operationData.consumedTenantSequences.includes(snapSeq))
+        operationData.consumedTenantSequences.push(snapSeq);
+    return true;
 }
 
 export function pickHostForOpRef(snap: FrozenRoundSnapshot, opRef: string): string {

@@ -3,6 +3,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 
 const { OperationType } = require('../../dist/models/cluster');
+const { syncConsumedTenantSequenceFromQuorum } = require('../../dist/cluster/DeterministicTx');
 const { createWorkDir } = require('./test-workdir');
 const {
     writeAcquiresFile,
@@ -11,12 +12,11 @@ const {
     defaultClusterNode,
     DEFAULT_ANCHOR,
     DEFAULT_TENANT_SEQUENCE,
-    TENANT_ADDRESS,
 } = require('./cluster-test-helpers');
 
 const EXTEND_PUBKEY = 'restart_extend_pubkey';
 
-describe('sequence consumed on ledger (node restart)', () => {
+describe('sequence consumed (quorum vs local read)', () => {
     let tmpDir;
     let originalCwd;
 
@@ -32,7 +32,14 @@ describe('sequence consumed on ledger (node restart)', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it('does not resubmit EXTEND when on-ledger sequence already advanced past snapshot', async () => {
+    it('marks snapshot sequence consumed when agreedTenantSequence advanced past snapshot', () => {
+        const operationData = { agreedTenantSequence: DEFAULT_TENANT_SEQUENCE + 1 };
+        const snapshot = { tenantSequence: DEFAULT_TENANT_SEQUENCE };
+        assert.strictEqual(syncConsumedTenantSequenceFromQuorum(operationData, snapshot), true);
+        assert.ok(operationData.consumedTenantSequences.includes(DEFAULT_TENANT_SEQUENCE));
+    });
+
+    it('failed local sequence read skips submit without writing consumed state', async () => {
         writeClusterFiles({
             nodes: [defaultClusterNode(EXTEND_PUBKEY)],
             operations: [{
@@ -48,10 +55,10 @@ describe('sequence consumed on ledger (node restart)', () => {
         const ctx = buildClusterContext({
             extendSubmit: async () => {
                 extendCalls++;
-                return { hash: 'should_not_run', code: 'tesSUCCESS' };
+                return { hash: 'h', code: 'tesSUCCESS' };
             },
             xrplContext: {
-                getAccountSequenceAtForObservation: async (_acc, _idx) => DEFAULT_TENANT_SEQUENCE + 1,
+                getAccountSequenceAtForObservation: async () => null,
                 getValidatedLedgerIndex: () => DEFAULT_ANCHOR + 30,
             },
         });
@@ -60,6 +67,6 @@ describe('sequence consumed on ledger (node restart)', () => {
         await ctx.deinit();
         assert.strictEqual(extendCalls, 0);
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.ok(ops.consumedTenantSequences?.includes(DEFAULT_TENANT_SEQUENCE));
+        assert.strictEqual(ops.consumedTenantSequences, undefined);
     });
 });

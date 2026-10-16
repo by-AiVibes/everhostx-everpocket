@@ -53,7 +53,7 @@ function seedNodeDirs(workRoot) {
     return dirs;
 }
 
-function runChild(workRoot, nodeDir, seed, round, lcl, phase) {
+function runChild(workRoot, nodeDir, seed, round, lcl, phase, extraEnv = {}) {
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [path.join(__dirname, 'queue-sim-child.js')], {
             env: {
@@ -66,6 +66,7 @@ function runChild(workRoot, nodeDir, seed, round, lcl, phase) {
                 EVP_LCL: String(lcl),
                 EVP_LCL_HASH: SHARED_LCL_HASH,
                 EVP_PHASE: phase,
+                ...extraEnv,
             },
             stdio: ['ignore', 'pipe', 'pipe'],
         });

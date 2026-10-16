@@ -22,7 +22,7 @@ import { error, info, log } from "../helpers/logger";
 import { JSONHelpers } from "../utils";
 import { applyObservationInputs, parseAnchorUserMessage, ANCHOR_OBSERVATION_MESSAGE_TYPE, NODE_USER_REGISTER_MESSAGE_TYPE } from "../cluster/AnchorObservation";
 import { requireMaxInputLedgerOffset } from "../cluster/QueueConfig";
-import { readTenantSequence } from "../cluster/DeterministicTx";
+import { readTenantSequence, syncConsumedTenantSequenceFromQuorum } from "../cluster/DeterministicTx";
 const DUMMY_OWNER_PUBKEY = "dummy_owner_pubkey";
 const SASHIMONO_NODEJS_IMAGE = "evernodedev/sashimono:hp.0.6.4-ubt.20.04-njs.20";
 const ALIVENESS_CHECK_THRESHOLD = 5;
@@ -336,19 +336,18 @@ class ClusterContext {
         if (this.operationData.consumedTenantSequences?.includes(seq))
             return;
 
+        if (syncConsumedTenantSequenceFromQuorum(this.operationData, snapshot)) {
+            this.updatedData = true;
+            return;
+        }
+
         const tenantAddress = snapshot.tenantAddress;
         const onLedgerSeq = await this.evernodeContext.xrplContext.getAccountSequenceAtForObservation(
             tenantAddress,
             snapshot.anchorLedger,
         );
-        if (onLedgerSeq !== null && onLedgerSeq > seq) {
-            if (!this.operationData.consumedTenantSequences)
-                this.operationData.consumedTenantSequences = [];
-            if (!this.operationData.consumedTenantSequences.includes(seq))
-                this.operationData.consumedTenantSequences.push(seq);
-            this.updatedData = true;
+        if (onLedgerSeq === null || onLedgerSeq > seq)
             return;
-        }
 
         const data = operation.data as ExtendNodeOperation;
         const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);

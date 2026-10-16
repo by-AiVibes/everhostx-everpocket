@@ -95,7 +95,11 @@ async function main() {
             getAccountSequenceAt: (acc, idx) => ledgerApi.getAccountSequenceAt(acc, idx),
             getLedgerHashAt: (idx) => ledgerApi.getLedgerHashAt(idx),
             getSignerListAtForObservation: (idx) => ledgerApi.getSignerListAt(idx),
-            getAccountSequenceAtForObservation: (acc, idx) => ledgerApi.getAccountSequenceAt(acc, idx).catch(() => null),
+            getAccountSequenceAtForObservation: (acc, idx) => {
+                if (process.env.EVP_SEQ_READER_FAIL === '1')
+                    return Promise.resolve(null);
+                return ledgerApi.getAccountSequenceAt(acc, idx).catch(() => null);
+            },
         },
     }, {
         lclSeqNo: lcl,
