@@ -580,7 +580,7 @@ class XrplContext {
         // Remove signer from the list and renew the signer list.
         const oldSignerIndex = signerListInfo.signerList.findIndex(s => s.account === oldSignerAddress);
         if (oldSignerIndex === -1)
-            throw `Could not find a old signer with given address.`
+            return;
 
         const newSignerIndex = signerListInfo.signerList.findIndex(s => s.account === newSignerAddress);
 

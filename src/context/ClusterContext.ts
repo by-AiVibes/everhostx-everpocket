@@ -154,23 +154,46 @@ class ClusterContext {
         return -1;
     }
 
-    /**
-     * Process operations one by one at each execution.
-     */
-    async #processOperations(deferAdd: boolean = false) {
-        if (this.operationData.operations.length === 0)
+    #signerAddressOnLedger(signerAddress: string): boolean {
+        const signerList = this.evernodeContext.xrplContext.getSignerList();
+        return !!signerList?.signerList?.some(s => s.account === signerAddress);
+    }
+
+    #majorityReportedSuccess(votes: { data?: { success?: boolean } }[]): boolean {
+        if (!votes?.length)
+            return false;
+        const successCount = votes.filter(v => v?.data?.success === true).length;
+        return successCount > votes.length / 2;
+    }
+
+    async #voteAgreedOperationSuccess(operation: Operation, curLcl: number, localSuccess: boolean): Promise<boolean> {
+        const electionName = `operation_outcome_${operation.ref}_${operation.type}_${curLcl}_${operation.retryCount ?? 0}`;
+        const unlCount = this.hpContext.getContractUnl().length;
+        const elector = new AllVoteElector(unlCount, TIMEOUT);
+        const votes = await this.voteContext.vote(electionName, [{ success: localSuccess }], elector);
+        return this.#majorityReportedSuccess(votes);
+    }
+
+    #applyQueuedOperationOutcome(operation: Operation, operationIndex: number, agreedSuccess: boolean, curLcl: number): void {
+        if (agreedSuccess) {
+            this.operationData.operations.splice(operationIndex, 1);
+            this.updatedData = true;
             return;
+        }
 
-        const curLcl = this.hpContext.lclSeqNo;
-        const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl);
-        if (operationIndex < 0)
-            return;
+        const retryCount = (operation.retryCount || 0) + 1;
+        operation.retryCount = retryCount;
+        if (retryCount >= MAX_OPERATION_RETRY_ATTEMPTS) {
+            error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_RETRY_ATTEMPTS} failed attempts.`);
+            this.operationData.operations.splice(operationIndex, 1);
+        } else {
+            const backoffLcl = Math.min(2 ** retryCount, 32);
+            operation.nextRetryLcl = curLcl + backoffLcl;
+        }
+        this.updatedData = true;
+    }
 
-        const operation = this.operationData.operations[operationIndex];
-
-        info(`Operations processor started.`);
-
-        try {
+    async #performOperation(operation: Operation): Promise<void> {
             if (operation.type === OperationType.ADD_NODE) {
                 const data = operation.data as AddNodeOperation;
 
@@ -206,7 +229,7 @@ class ClusterContext {
 
                 log(`Removing the node ${pubkey}...`);
 
-                if (node?.signerAddress) {
+                if (node?.signerAddress && this.#signerAddressOnLedger(node.signerAddress)) {
                     const nonQuorumNodes = this.getClusterUnlNodes().filter(n => !n.signerAddress);
 
                     if (nonQuorumNodes.length > 0 && (node?.signerReplaceFailedAttempts || 0) < MAX_SIGNER_REPLACE_ATTEMPTS) {
@@ -282,31 +305,44 @@ class ClusterContext {
                 }
 
                 // Update peer list.
-                if (node) {
-                    if (node?.domain && node?.peerPort) {
-                        let peer = `${node?.domain}:${node?.peerPort}`
+                const clusterNode = this.clusterManager.getNode(pubkey);
+                if (clusterNode) {
+                    if (clusterNode?.domain && clusterNode?.peerPort) {
+                        let peer = `${clusterNode?.domain}:${clusterNode?.peerPort}`
                         await this.hpContext.updatePeers(null, [peer]);
                     }
 
                     this.clusterManager.removeNode(pubkey);
                 }
             }
+    }
 
-            this.operationData.operations.splice(operationIndex, 1);
-            this.updatedData = true;
+    /**
+     * Process operations one by one at each execution.
+     */
+    async #processOperations(deferAdd: boolean = false) {
+        if (this.operationData.operations.length === 0)
+            return;
+
+        const curLcl = this.hpContext.lclSeqNo;
+        const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl);
+        if (operationIndex < 0)
+            return;
+
+        const operation = this.operationData.operations[operationIndex];
+
+        info(`Operations processor started.`);
+
+        let localSuccess = false;
+        try {
+            await this.#performOperation(operation);
+            localSuccess = true;
         } catch (e) {
             error(e);
-            const retryCount = (operation.retryCount || 0) + 1;
-            operation.retryCount = retryCount;
-            if (retryCount >= MAX_OPERATION_RETRY_ATTEMPTS) {
-                error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_RETRY_ATTEMPTS} failed attempts.`);
-                this.operationData.operations.splice(operationIndex, 1);
-            } else {
-                const backoffLcl = Math.min(2 ** retryCount, 32);
-                operation.nextRetryLcl = curLcl + backoffLcl;
-            }
-            this.updatedData = true;
         }
+
+        const agreedSuccess = await this.#voteAgreedOperationSuccess(operation, curLcl, localSuccess);
+        this.#applyQueuedOperationOutcome(operation, operationIndex, agreedSuccess, curLcl);
 
         info(`Operations processor ended.`);
     }

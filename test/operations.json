@@ -1,0 +1,14 @@
+{
+    "operations": [
+        {
+            "type": "remove_node",
+            "ref": "consensus_remove_target_pubkey",
+            "data": {
+                "nodePubkey": "consensus_remove_target_pubkey",
+                "force": true
+            },
+            "retryCount": 1,
+            "nextRetryLcl": 102
+        }
+    ]
+}

@@ -47,7 +47,7 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
 
     const voteContext = {
         getUniqueNumber: () => 1,
-        vote: async () => [],
+        vote: async (_electionName, cast) => [{ sender: 'self', data: cast[0] }],
     };
 
     const evernodeContext = {
