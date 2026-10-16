@@ -7,4 +7,7 @@ export interface NomadOptions {
   preferredHosts?: string[];
   instanceCfg?: InstanceConfig;
   parallelGrow?: boolean;
+  inactivePruneLcl?: number;
+  immaturePruneLcl?: number;
+  expirePruneTsMs?: number;
 }

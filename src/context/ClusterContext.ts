@@ -42,6 +42,7 @@ class ClusterContext {
     private maturityLclThreshold: number;
     private acknowledgeLclThreshold: number;
     private acknowledgeRetryLclThreshold: number;
+    private maxOpsPerRound: number;
     private initialized: boolean = false;
     public hpContext: HotPocketContext;
     public voteContext: VoteContext;
@@ -55,6 +56,10 @@ class ClusterContext {
         this.maturityLclThreshold = options.maturityLclThreshold || MATURITY_LCL_THRESHOLD;
         this.acknowledgeLclThreshold = options.acknowledgeLclThreshold || ACKNOWLEDGE_LCL_THRESHOLD;
         this.acknowledgeRetryLclThreshold = options.acknowledgeLclThreshold || ACKNOWLEDGE_RETRY_LCL_THRESHOLD;
+        const maxOpsPerRound = options.maxOpsPerRound ?? 1;
+        if (maxOpsPerRound < 1)
+            throw 'maxOpsPerRound must be at least 1';
+        this.maxOpsPerRound = maxOpsPerRound;
         this.userMessageProcessing = false;
 
         const data = JSONHelpers.readFromFile<OperationData>(this.operationDataFile);
@@ -153,12 +158,22 @@ class ClusterContext {
      * First queued operation that may run this round (FIFO among eligible ops).
      * @param deferAdd When true, skip ADD_NODE ops this round (pending aliveness probe).
      */
-    #findProcessableOperationIndex(deferAdd: boolean, curLcl: number): number {
+    #removeOperationTouchesSigner(operation: Operation): boolean {
+        if (operation.type !== OperationType.REMOVE_NODE)
+            return false;
+        const pubkey = (operation.data as RemoveNodeOperation).nodePubkey;
+        const node = this.clusterManager.getNode(pubkey);
+        return !!node?.signerAddress;
+    }
+
+    #findProcessableOperationIndex(deferAdd: boolean, curLcl: number, signerRemovesUsed: number, maxSignerRemovesPerRound: number): number {
         for (let i = 0; i < this.operationData.operations.length; i++) {
             const op = this.operationData.operations[i];
             if (deferAdd && op.type === OperationType.ADD_NODE)
                 continue;
             if (op.nextRetryLcl !== undefined && op.nextRetryLcl > curLcl)
+                continue;
+            if (this.#removeOperationTouchesSigner(op) && signerRemovesUsed >= maxSignerRemovesPerRound)
                 continue;
             return i;
         }
@@ -371,28 +386,42 @@ class ClusterContext {
             return;
 
         const curLcl = this.hpContext.lclSeqNo;
-        const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl);
-        if (operationIndex < 0)
-            return;
+        const maxSignerRemovesPerRound = 1;
+        let signerRemovesUsed = 0;
 
-        const operation = this.operationData.operations[operationIndex];
-        const completeInAgreedState = this.#isOperationCompleteInAgreedState(operation, roundState);
+        for (let processed = 0; processed < this.maxOpsPerRound; processed++) {
+            const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl, signerRemovesUsed, maxSignerRemovesPerRound);
+            if (operationIndex < 0)
+                break;
 
-        info(`Operations processor started.`);
+            const operation = this.operationData.operations[operationIndex];
+            const touchesSigner = this.#removeOperationTouchesSigner(operation);
+            const completeInAgreedState = this.#isOperationCompleteInAgreedState(operation, roundState);
 
-        if (completeInAgreedState) {
-            this.operationData.operations.splice(operationIndex, 1);
-            this.updatedData = true;
-        } else {
-            try {
-                await this.#performOperation(operation, roundState);
-            } catch (e) {
-                error(e);
+            info(`Operations processor started.`);
+
+            if (completeInAgreedState) {
+                this.operationData.operations.splice(operationIndex, 1);
+                this.updatedData = true;
+            } else {
+                try {
+                    await this.#performOperation(operation, roundState);
+                } catch (e) {
+                    error(e);
+                }
+                this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
             }
+<<<<<<< HEAD
             await this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
         }
+=======
+>>>>>>> dba3e74 (Batch 2: configurable prune thresholds and parallel ops per round)
 
-        info(`Operations processor ended.`);
+            if (touchesSigner)
+                signerRemovesUsed++;
+
+            info(`Operations processor ended.`);
+        }
     }
 
     /**
@@ -786,7 +815,8 @@ class ClusterContext {
             }
         }
 
-        this.#queueOperation(OperationType.ADD_NODE, `${options.host}${this.hpContext.lclHash}`, <AddNodeOperation>{
+        const addRef = `${options.host ?? ''}${this.hpContext.lclHash}:${this.operationData.operations.length}`;
+        this.#queueOperation(OperationType.ADD_NODE, addRef, <AddNodeOperation>{
             acquireOptions: options,
             lifeMoments: lifeMoments,
             maxLifeMoments: maxLifeMoments
