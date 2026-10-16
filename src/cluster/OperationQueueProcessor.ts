@@ -1,10 +1,10 @@
 import { FrozenRoundSnapshot } from './RoundSnapshot';
 import {
-    ExtendNodeOperation,
     Operation,
     OperationType,
 } from '../models/cluster';
 import { SignerListInfo } from '../models';
+import { buildLastLedgerSequenceFromSnapshot, computeExtendTxHash } from './DeterministicTx';
 
 export const MAX_OPERATION_ATTEMPTS = 8;
 export const MAX_OPS_PER_ROUND = 1;
@@ -30,26 +30,23 @@ export function isHeldOperationType(type: OperationType): boolean {
     return type === OperationType.ADD_NODE || type === OperationType.REMOVE_NODE;
 }
 
-export async function isExtendComplete(
-    op: Operation,
-    snap: FrozenRoundSnapshot,
-    ledger: QueueLedgerReader,
-): Promise<boolean> {
-    const data = op.data as ExtendNodeOperation;
-    if (!data.extendTxHash || data.extendLedgerCap === undefined)
+export function extendLastLedgerSequence(snap: FrozenRoundSnapshot): number {
+    return buildLastLedgerSequenceFromSnapshot(snap);
+}
+
+export function isExtendComplete(op: Operation, snap: FrozenRoundSnapshot): boolean {
+    if (op.type !== OperationType.EXTEND_NODE)
         return false;
-    if (snap.anchorLedger < data.extendLedgerCap)
-        return false;
-    const tx = await ledger.getTxAt(data.extendTxHash, snap.anchorLedger);
-    return !!tx && tx.resultCode === 'tesSUCCESS';
+    const entry = snap.extendLedgerChecks.find((e) => e.ref === op.ref);
+    return !!entry?.tx && entry.tx.resultCode === 'tesSUCCESS';
 }
 
 export async function isOperationComplete(
     op: Operation,
     snap: FrozenRoundSnapshot,
-    ledger: QueueLedgerReader,
+    _ledger: QueueLedgerReader,
 ): Promise<boolean> {
     if (op.type === OperationType.EXTEND_NODE)
-        return await isExtendComplete(op, snap, ledger);
+        return isExtendComplete(op, snap);
     return false;
 }

@@ -53,6 +53,26 @@ describe('Phase 1 queue core', () => {
         assert.strictEqual(ops.operations[0].attempt ?? 0, 0);
     });
 
+    it('skips held ADD at head and still runs EXTEND behind it', async () => {
+        writeClusterFiles({
+            nodes: [defaultClusterNode(EXTEND_PUBKEY)],
+            operations: [
+                { type: OperationType.ADD_NODE, ref: 'add', data: { acquireOptions: {}, lifeMoments: 1 } },
+                { type: OperationType.EXTEND_NODE, ref: EXTEND_PUBKEY, data: { nodePubkey: EXTEND_PUBKEY, moments: 1 } },
+            ],
+        });
+        let extendCalls = 0;
+        const ctx = buildClusterContext({
+            extendSubmit: async () => {
+                extendCalls++;
+                throw new Error('fail');
+            },
+        });
+        await ctx.init();
+        await ctx.deinit();
+        assert.strictEqual(extendCalls, 1);
+    });
+
     it('holds REMOVE at queue head untouched', async () => {
         const pk = 'remove_held_pubkey';
         writeClusterFiles({
@@ -133,31 +153,45 @@ describe('Phase 1 queue core', () => {
     });
 
     it('dequeues EXTEND when agreed ledger shows tesSUCCESS at cap', async () => {
-        const hash = '0xextend_done';
-        const cap = DEFAULT_ANCHOR;
+        const { computeExtendTxHash } = require('../../dist/cluster/DeterministicTx');
+        const { RoundSnapshot } = require('../../dist/cluster/RoundSnapshot');
+        const lls = DEFAULT_ANCHOR + 30;
+        const nodes = [{
+            ...defaultClusterNode(EXTEND_PUBKEY),
+            lifeMoments: 1,
+            targetLifeMoments: 5,
+        }];
         writeClusterFiles({
-            nodes: [{
-                ...defaultClusterNode(EXTEND_PUBKEY),
-                lifeMoments: 1,
-                targetLifeMoments: 5,
-            }],
+            nodes,
+            anchorLedger: DEFAULT_ANCHOR,
             operations: [{
                 type: OperationType.EXTEND_NODE,
                 ref: EXTEND_PUBKEY,
-                data: {
-                    nodePubkey: EXTEND_PUBKEY,
-                    moments: 4,
-                    extendTxHash: hash,
-                    extendLedgerCap: cap,
-                },
+                data: { nodePubkey: EXTEND_PUBKEY, moments: 4 },
             }],
         });
-        const ctx = buildClusterContext({
-            xrplContext: {
-                getTxAt: async (h) => (h === hash ? { resultCode: 'tesSUCCESS', lastLedgerSequence: cap + 30 } : null),
-                getValidatedLedgerIndex: () => DEFAULT_ANCHOR,
-            },
+        const op = { type: OperationType.EXTEND_NODE, ref: EXTEND_PUBKEY, data: { nodePubkey: EXTEND_PUBKEY, moments: 4 } };
+        const snap = RoundSnapshot.capture({
+            lclSeqNo: 100,
+            lclHash: 'hash',
+            operationData: JSON.parse(fs.readFileSync('operations.json', 'utf8')),
+            clusterData: { initialized: true, nodes, pendingNodes: [] },
+            acquireData: { acquiredNodes: [], pendingAcquires: [] },
+            contractUnl: [],
+            signerListInfo: null,
+            tenantSequence: 42,
+            tenantAddress: 'rTenantAgreedAddress',
+            feeCeiling: '12000000',
+            hostList: ['host.alpha', 'host.beta'],
+            extendLedgerChecks: [],
         });
+        const hash = computeExtendTxHash(snap, op);
+        const ledgerHooks = {
+            getTxAt: async (h, idx) => (h === hash && idx === lls ? { resultCode: 'tesSUCCESS', lastLedgerSequence: lls } : null),
+            getValidatedLedgerIndex: () => lls,
+            getAccountSequenceAt: async () => 42,
+        };
+        const ctx = buildClusterContext({ xrplContext: ledgerHooks }, {}, ledgerHooks);
         await ctx.init();
         await ctx.deinit();
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));

@@ -4,11 +4,16 @@ const { ClusterContext } = require('../../dist');
 
 const DEFAULT_ANCHOR = 1_000_000;
 const DEFAULT_TENANT_SEQUENCE = 42;
+const TENANT_ADDRESS = 'rTenantAgreedAddress';
 
 function consensusContract(unlPubkeys = []) {
     const state = {
         unl: [...unlPubkeys],
-        evernode: { hosts: ['host.alpha', 'host.beta'], feeCeiling: '12000000' },
+        evernode: {
+            hosts: ['host.alpha', 'host.beta'],
+            feeCeiling: '12000000',
+            anchorLedger: DEFAULT_ANCHOR,
+        },
         consensus: { roundtime: 1000, stage_slice: 100 },
     };
     return {
@@ -31,7 +36,7 @@ function readAcquiresFile() {
     return JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
 }
 
-function writeClusterFiles({ nodes = [], pendingNodes = [], operations, anchorLedger = DEFAULT_ANCHOR, tenantSequence = DEFAULT_TENANT_SEQUENCE }) {
+function writeClusterFiles({ nodes = [], pendingNodes = [], operations, anchorLedger = DEFAULT_ANCHOR }) {
     fs.writeFileSync('cluster.json', JSON.stringify({
         initialized: true,
         nodes,
@@ -40,7 +45,6 @@ function writeClusterFiles({ nodes = [], pendingNodes = [], operations, anchorLe
     fs.writeFileSync('operations.json', JSON.stringify({
         operations,
         anchorLedger,
-        tenantSequence,
     }, null, 4));
 }
 
@@ -61,7 +65,7 @@ function defaultClusterNode(pubkey) {
     };
 }
 
-function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
+function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}, ledgerHooks = {}) {
     const { xrplContext: xrplOverrides, ...restEvernodeOverrides } = evernodeContextOverrides;
     const hpContext = {
         publicKey: 'self_pubkey',
@@ -71,7 +75,11 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
         timestamp: Date.now(),
         getContractConfig: async () => ({
             unl: [],
-            evernode: { hosts: ['host.alpha', 'host.beta'], feeCeiling: '12000000' },
+            evernode: {
+                hosts: ['host.alpha', 'host.beta'],
+                feeCeiling: '12000000',
+                anchorLedger: DEFAULT_ANCHOR,
+            },
             consensus: { roundtime: 1000, stage_slice: 100 },
         }),
         getContractUnl: () => [],
@@ -87,18 +95,30 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
     };
 
     const defaultXrpl = {
-        xrplAcc: { address: 'rTenantAgreedAddress' },
+        xrplAcc: { address: TENANT_ADDRESS },
         bootstrapForRound: async () => {},
         reconcileValidatedTransactions: async () => {},
-        deriveTxSubmitInfo: (snap) => ({
-            sequence: snap.tenantSequence,
-            maxLedgerSequence: snap.anchorLedger + 30,
-            fee: snap.feeCeiling,
-        }),
-        getValidatedLedgerIndex: () => DEFAULT_ANCHOR,
+        deriveTxSubmitInfo: (snap) => {
+            const { deriveTxSubmitInfo } = require('../../dist/context/XrplContext');
+            // use real derivation via snapshot-shaped object
+            const { readFeeCeiling, readTenantSequence, buildLastLedgerSequenceFromSnapshot } = require('../../dist/cluster/DeterministicTx');
+            return {
+                sequence: readTenantSequence(snap),
+                maxLedgerSequence: buildLastLedgerSequenceFromSnapshot(snap),
+                fee: readFeeCeiling(snap),
+            };
+        },
+        getValidatedLedgerIndex: () => ledgerHooks.getValidatedLedgerIndex?.() ?? DEFAULT_ANCHOR,
         getSignerList: () => null,
-        getSignerListAt: async () => ({ signerQuorum: 1, signerList: [] }),
-        getTxAt: async () => null,
+        getSignerListAt: async (idx) => ledgerHooks.getSignerListAt?.(idx) ?? { signerQuorum: 1, signerList: [] },
+        getAccountSequenceAt: async (account, idx) => {
+            if (ledgerHooks.getAccountSequenceAt)
+                return ledgerHooks.getAccountSequenceAt(account, idx);
+            if (idx === DEFAULT_ANCHOR && account === TENANT_ADDRESS)
+                return DEFAULT_TENANT_SEQUENCE;
+            throw new Error(`No sequence stub for ${account}@${idx}`);
+        },
+        getTxAt: async (hash, idx) => ledgerHooks.getTxAt?.(hash, idx) ?? null,
         deinit: async () => {},
         multiSigner: { isSignerNode: () => false, getSigner: () => null },
         ...(xrplOverrides || {}),
@@ -127,8 +147,8 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
     return new ClusterContext(evernodeContext);
 }
 
-async function runClusterRound(evernodeOverrides, hpOverrides) {
-    const ctx = buildClusterContext(evernodeOverrides, hpOverrides);
+async function runClusterRound(evernodeOverrides, hpOverrides, ledgerHooks) {
+    const ctx = buildClusterContext(evernodeOverrides, hpOverrides, ledgerHooks);
     await ctx.init();
     await ctx.deinit();
     return ctx;
@@ -137,6 +157,7 @@ async function runClusterRound(evernodeOverrides, hpOverrides) {
 module.exports = {
     DEFAULT_ANCHOR,
     DEFAULT_TENANT_SEQUENCE,
+    TENANT_ADDRESS,
     consensusContract,
     writeAcquiresFile,
     readAcquiresFile,

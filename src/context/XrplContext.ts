@@ -324,10 +324,13 @@ class XrplContext {
         if (!this.signerListInfo || !signerCount)
             throw `${transaction.TransactionType} | Could not get signer list`;
 
-        if (txSubmitInfo.fee)
+        if (options?.txSubmitInfo) {
+            if (!txSubmitInfo.fee)
+                throw new Error(`${transaction.TransactionType} | Missing fee in txSubmitInfo`);
             transaction.Fee = txSubmitInfo.fee;
-        else
+        } else {
             transaction.Fee = `${Number(transaction.Fee) * (signerCount + 2)}`;
+        }
 
         const elector = new AllVoteElector(signerCount, options?.voteElectorOptions?.timeout || TIMEOUT);
         const electionName = `sign${this.voteContext.getUniqueNumber()}`;
@@ -660,6 +663,14 @@ class XrplContext {
         if (this.xahauLedger)
             return await this.xahauLedger.getSignerListAt(ledgerIndex);
         throw new Error(`Pinned Xahau read required for getSignerListAt(${ledgerIndex})`);
+    }
+
+    public async getAccountSequenceAt(account: string, ledgerIndex: number): Promise<number> {
+        if (ledgerIndex > 0 && this.getValidatedLedgerIndex() < ledgerIndex)
+            throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
+        if (this.xahauLedger)
+            return await this.xahauLedger.getAccountSequenceAt(account, ledgerIndex);
+        throw new Error(`Pinned Xahau read required for getAccountSequenceAt(${account}, ${ledgerIndex})`);
     }
 
     /**

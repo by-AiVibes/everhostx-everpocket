@@ -5,6 +5,11 @@ class FakeXahauLedger {
         this.txsByLedger = new Map();
         this.signerListsByLedger = new Map();
         this.acquireCanonical = new Map();
+        this.accountSequences = new Map();
+    }
+
+    setAccountSequenceAt(account, ledgerIndex, sequence) {
+        this.accountSequences.set(`${ledgerIndex}:${account}`, sequence);
     }
 
     setGlobalValidatedIndex(idx) {
@@ -39,6 +44,13 @@ class FakeXahauLedger {
 
     async getSignerListAt(ledgerIndex) {
         return this.signerListsByLedger.get(ledgerIndex) ?? { signerQuorum: 1, signerList: [] };
+    }
+
+    async getAccountSequenceAt(account, ledgerIndex) {
+        const key = `${ledgerIndex}:${account}`;
+        if (!this.accountSequences.has(key))
+            throw new Error(`No pinned sequence for ${account} at ${ledgerIndex}`);
+        return this.accountSequences.get(key);
     }
 
     async getAccountTxAt() {

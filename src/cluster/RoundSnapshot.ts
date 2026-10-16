@@ -1,6 +1,7 @@
 import { AcquireData } from '../models/evernode';
 import { ClusterData, ExtendNodeOperation, Operation, OperationData } from '../models/cluster';
 import { SignerListInfo as XrplSignerListInfo } from '../models';
+import { TransactionInfo } from '../models/xrpl';
 
 export type FrozenRoundSnapshot = {
     lclSeqNo: number;
@@ -15,6 +16,15 @@ export type FrozenRoundSnapshot = {
     tenantAddress: string;
     feeCeiling: string;
     hostList: string[];
+    /** Pinned extend tx lookups captured once at round start (agreed ledger view). */
+    extendLedgerChecks: ExtendLedgerCheck[];
+};
+
+export type ExtendLedgerCheck = {
+    ref: string;
+    hash: string;
+    lastLedgerSequence: number;
+    tx: TransactionInfo | null;
 };
 
 function deepFreeze<T>(obj: T): T {
@@ -54,6 +64,7 @@ export class RoundSnapshot {
         tenantAddress: string;
         feeCeiling: string;
         hostList: string[];
+        extendLedgerChecks: ExtendLedgerCheck[];
     }): FrozenRoundSnapshot {
         const anchorLedger = computeAnchorLedger(params.operationData);
         const snap: FrozenRoundSnapshot = {
@@ -74,6 +85,7 @@ export class RoundSnapshot {
                     signerList: params.signerListInfo.signerList.map((s) => ({ ...s })),
                 }
                 : null,
+            extendLedgerChecks: params.extendLedgerChecks.map((c) => ({ ...c })),
         };
         return deepFreeze(snap);
     }

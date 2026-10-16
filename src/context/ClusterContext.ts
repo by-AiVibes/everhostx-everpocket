@@ -6,6 +6,7 @@ import { ClusterOptions, ClusterMessage, ClusterMessageResponse, ClusterMessageR
 import { ClusterManager } from "../cluster";
 import {
     MAX_OPERATION_ATTEMPTS,
+    MAX_OPS_PER_ROUND,
     backoffLcl,
     isHeldOperationType,
     isOperationComplete,
@@ -13,7 +14,8 @@ import {
     operationNextAttemptLcl,
 } from "../cluster/OperationQueueProcessor";
 import { FrozenRoundSnapshot, RoundSnapshot } from "../cluster/RoundSnapshot";
-import { buildLastLedgerSequenceFromSnapshot } from "../cluster/DeterministicTx";
+import { buildLastLedgerSequenceFromSnapshot, computeExtendTxHash, pickHostForOpRef } from "../cluster/DeterministicTx";
+import { extendLastLedgerSequence } from "../cluster/OperationQueueProcessor";
 import { AllVoteElector } from "../vote/vote-electors";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
@@ -41,7 +43,6 @@ class ClusterContext {
     private acknowledgeRetryLclThreshold: number;
     private initialized: boolean = false;
     private roundAborted: boolean = false;
-    private deferredOpCaps: { ref: string; extendTxHash?: string; extendLedgerCap?: number }[] = [];
     public hpContext: HotPocketContext;
     public voteContext: VoteContext;
     public evernodeContext: EvernodeContext;
@@ -71,7 +72,6 @@ class ClusterContext {
             return;
 
         this.roundAborted = false;
-        this.#applyDeferredClusterWrites();
 
         try {
             await this.evernodeContext.bootstrapForRound();
@@ -105,7 +105,6 @@ class ClusterContext {
      */
     public async deinit(): Promise<void> {
         if (!this.roundAborted) {
-            this.#applyDeferredClusterWrites();
             this.clusterManager.persist();
             this.#persistOperationData();
         }
@@ -118,58 +117,93 @@ class ClusterContext {
         return this.roundAborted;
     }
 
-    #applyDeferredClusterWrites(): void {
-        let touched = false;
-        for (const patch of this.deferredOpCaps) {
-            const op = this.operationData.operations.find((o) => o.ref === patch.ref);
-            if (!op)
-                continue;
-            const data = op.data as ExtendNodeOperation;
-            if (patch.extendTxHash)
-                data.extendTxHash = patch.extendTxHash;
-            if (patch.extendLedgerCap !== undefined)
-                data.extendLedgerCap = patch.extendLedgerCap;
-            touched = true;
-        }
-        this.deferredOpCaps = [];
-        if (touched)
-            this.updatedData = true;
-    }
-
     #ledgerReader() {
         return this.evernodeContext.xrplContext;
     }
 
     async #captureRoundSnapshot(): Promise<FrozenRoundSnapshot> {
         const config = await this.hpContext.getContractConfig();
-        const evernodeCfg = (config as { evernode?: { feeCeiling?: string; hosts?: string[] } }).evernode;
+        const evernodeCfg = (config as { evernode?: { feeCeiling?: string; hosts?: string[]; anchorLedger?: number } }).evernode;
         if (!evernodeCfg?.feeCeiling || !Array.isArray(evernodeCfg.hosts) || evernodeCfg.hosts.length === 0)
             throw new Error('Missing evernode queue config in agreed contract state');
-        if (this.operationData.tenantSequence === undefined)
-            throw new Error('Missing tenantSequence in agreed operation state');
         const tenantAddress = this.evernodeContext.xrplContext.xrplAcc?.address;
         if (!tenantAddress)
             throw new Error('Missing tenant address for queue snapshot');
 
+        const anchor = this.operationData.anchorLedger ?? evernodeCfg.anchorLedger;
+        if (anchor === undefined)
+            throw new Error('Missing anchorLedger in agreed operation or contract state');
+
         const validated = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
-        const anchor = this.operationData.anchorLedger ?? 0;
         const signerList = anchor > 0 && validated >= anchor
             ? await this.evernodeContext.xrplContext.getSignerListAt(anchor)
             : null;
 
-        return RoundSnapshot.capture({
+        const tenantSequence = anchor > 0 && validated >= anchor
+            ? await this.evernodeContext.xrplContext.getAccountSequenceAt(tenantAddress, anchor)
+            : 0;
+
+        const operationDataCopy = JSON.parse(JSON.stringify(this.operationData));
+        const preSnap = {
             lclSeqNo: this.hpContext.lclSeqNo,
             lclHash: this.hpContext.lclHash,
-            operationData: JSON.parse(JSON.stringify(this.operationData)),
-            clusterData: this.clusterManager.snapshotClusterData(),
+            anchorLedger: anchor,
+            unl: [...config.unl],
+            cluster: this.clusterManager.snapshotClusterData(),
+            operations: operationDataCopy.operations,
             acquireData: this.evernodeContext.getAcquireDataSnapshot(),
-            contractUnl: config.unl,
-            signerListInfo: signerList,
-            tenantSequence: this.operationData.tenantSequence,
+            signerList: signerList,
+            tenantSequence,
             tenantAddress,
             feeCeiling: evernodeCfg.feeCeiling,
             hostList: evernodeCfg.hosts,
+        };
+
+        const extendLedgerChecks = [];
+        for (const op of operationDataCopy.operations) {
+            if (op.type !== OperationType.EXTEND_NODE)
+                continue;
+            const snapForHash = RoundSnapshot.capture({
+                lclSeqNo: preSnap.lclSeqNo,
+                lclHash: preSnap.lclHash,
+                operationData: operationDataCopy,
+                clusterData: preSnap.cluster,
+                acquireData: preSnap.acquireData,
+                contractUnl: preSnap.unl,
+                signerListInfo: signerList,
+                tenantSequence: preSnap.tenantSequence,
+                tenantAddress: preSnap.tenantAddress,
+                feeCeiling: preSnap.feeCeiling,
+                hostList: preSnap.hostList,
+                extendLedgerChecks: [],
+            });
+            const hash = computeExtendTxHash(snapForHash, op);
+            const lls = extendLastLedgerSequence(snapForHash);
+            const tx = validated >= lls
+                ? await this.evernodeContext.xrplContext.getTxAt(hash, lls)
+                : null;
+            extendLedgerChecks.push({ ref: op.ref, hash, lastLedgerSequence: lls, tx });
+        }
+
+        return RoundSnapshot.capture({
+            lclSeqNo: this.hpContext.lclSeqNo,
+            lclHash: this.hpContext.lclHash,
+            operationData: operationDataCopy,
+            clusterData: preSnap.cluster,
+            acquireData: preSnap.acquireData,
+            contractUnl: config.unl,
+            signerListInfo: signerList,
+            tenantSequence,
+            tenantAddress,
+            feeCeiling: evernodeCfg.feeCeiling,
+            hostList: evernodeCfg.hosts,
+            extendLedgerChecks,
         });
+    }
+
+    #advanceAgreedAnchor(snapshot: FrozenRoundSnapshot): void {
+        this.operationData.anchorLedger = buildLastLedgerSequenceFromSnapshot(snapshot);
+        this.updatedData = true;
     }
 
     /**
@@ -234,25 +268,20 @@ class ClusterContext {
     }
 
     async #performExtendOperation(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<void> {
-        const data = operation.data as ExtendNodeOperation;
-        if (data.extendTxHash)
+        const ledger = this.#ledgerReader();
+        if (await isOperationComplete(operation, snapshot, ledger))
             return;
 
+        const data = operation.data as ExtendNodeOperation;
         const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
         if (!snapNode)
             return;
 
-        log(`Extending node ${snapNode.pubkey} by ${data.moments}...`);
-        const res = await this.evernodeContext.extendSubmit(snapNode.host, data.moments, snapNode.name, {
+        const host = pickHostForOpRef(snapshot, operation.ref);
+        log(`Extending node ${snapNode.pubkey} by ${data.moments} via host ${host}...`);
+        await this.evernodeContext.extendSubmit(host, data.moments, snapNode.name, {
             txSubmitInfo: this.evernodeContext.xrplContext.deriveTxSubmitInfo(snapshot),
         });
-        if (res?.hash) {
-            this.deferredOpCaps.push({
-                ref: operation.ref,
-                extendTxHash: res.hash,
-                extendLedgerCap: buildLastLedgerSequenceFromSnapshot(snapshot),
-            });
-        }
     }
 
     /**
@@ -262,56 +291,66 @@ class ClusterContext {
         if (this.operationData.operations.length === 0)
             return;
 
-        const operationIndex = 0;
-        const operation = this.operationData.operations[operationIndex];
         const ledger = this.#ledgerReader();
         const curLcl = this.hpContext.lclSeqNo;
+        let actions = 0;
 
         info(`Operations processor started.`);
 
-        if (await isOperationComplete(operation, snapshot, ledger)) {
-            await this.#onOperationDequeued(operation, snapshot);
-            this.operationData.operations.splice(operationIndex, 1);
+        for (let i = 0; i < this.operationData.operations.length && actions < MAX_OPS_PER_ROUND; i++) {
+            const operation = this.operationData.operations[i];
+            if (await isOperationComplete(operation, snapshot, ledger)) {
+                await this.#onOperationDequeued(operation, snapshot);
+                this.operationData.operations.splice(i, 1);
+                this.updatedData = true;
+                if (operation.type === OperationType.EXTEND_NODE)
+                    this.#advanceAgreedAnchor(snapshot);
+                actions++;
+                break;
+            }
+        }
+
+        if (actions >= MAX_OPS_PER_ROUND) {
+            info(`Operations processor ended.`);
+            return;
+        }
+
+        for (let i = 0; i < this.operationData.operations.length && actions < MAX_OPS_PER_ROUND; i++) {
+            const operation = this.operationData.operations[i];
+
+            if (isHeldOperationType(operation.type)) {
+                log(`Operation ${operation.ref} held: held`);
+                continue;
+            }
+
+            if (operation.type !== OperationType.EXTEND_NODE)
+                continue;
+
+            const nextAttempt = operationNextAttemptLcl(operation);
+            if (nextAttempt !== undefined && nextAttempt > curLcl)
+                continue;
+
+            const attempt = operationAttempt(operation) + 1;
+            operation.attempt = attempt;
+            delete operation.retryCount;
+            operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
+            delete operation.nextRetryLcl;
             this.updatedData = true;
-            info(`Operations processor ended.`);
-            return;
-        }
 
-        const nextAttempt = operationNextAttemptLcl(operation);
-        if (nextAttempt !== undefined && nextAttempt > curLcl) {
-            info(`Operations processor ended.`);
-            return;
-        }
+            if (attempt > MAX_OPERATION_ATTEMPTS) {
+                error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_ATTEMPTS} failed attempts.`);
+                this.operationData.operations.splice(i, 1);
+                actions++;
+                break;
+            }
 
-        if (isHeldOperationType(operation.type)) {
-            log(`Operation ${operation.ref} held: held`);
-            info(`Operations processor ended.`);
-            return;
-        }
-
-        if (operation.type !== OperationType.EXTEND_NODE) {
-            info(`Operations processor ended.`);
-            return;
-        }
-
-        const attempt = operationAttempt(operation) + 1;
-        operation.attempt = attempt;
-        delete operation.retryCount;
-        operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
-        delete operation.nextRetryLcl;
-        this.updatedData = true;
-
-        if (attempt > MAX_OPERATION_ATTEMPTS) {
-            error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_ATTEMPTS} failed attempts.`);
-            this.operationData.operations.splice(operationIndex, 1);
-            info(`Operations processor ended.`);
-            return;
-        }
-
-        try {
-            await this.#performExtendOperation(operation, snapshot);
-        } catch (e) {
-            error(e);
+            try {
+                await this.#performExtendOperation(operation, snapshot);
+            } catch (e) {
+                error(e);
+            }
+            actions++;
+            break;
         }
 
         info(`Operations processor ended.`);

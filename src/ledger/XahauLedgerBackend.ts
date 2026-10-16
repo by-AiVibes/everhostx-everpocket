@@ -17,5 +17,7 @@ export interface XahauLedgerBackend {
 
     getSignerListAt(ledgerIndex: number): Promise<SignerListInfo | null>;
 
+    getAccountSequenceAt(account: string, ledgerIndex: number): Promise<number>;
+
     getAccountTxAt(account: string, ledgerIndexMax: number): Promise<unknown[]>;
 }

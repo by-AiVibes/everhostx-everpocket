@@ -86,10 +86,8 @@ export interface Operation {
 
 export interface OperationData {
   operations: Operation[];
-  /** Agreed Xahau ledger anchor for deterministic queue rounds. */
+  /** Agreed Xahau ledger anchor; advances only on agreed EXTEND completion (see docs/queue-agreed-state.md). */
   anchorLedger?: number;
-  /** Agreed tenant account sequence at round boundary. */
-  tenantSequence?: number;
 }
 
 export enum ClusterMessageType {
