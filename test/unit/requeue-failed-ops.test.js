@@ -9,6 +9,7 @@ const {
     defaultClusterNode,
     buildClusterContext,
     consensusContract,
+    runClusterUntilSettled,
 } = require('./cluster-test-helpers');
 
 const DEAD_PUBKEY = 'dead_node_pubkey_for_remove_test';
@@ -83,9 +84,7 @@ describe('Fix 1: re-queue failed operations with retry metadata', () => {
         assert.strictEqual(ops.operations.length, 1);
         const nextRetryLcl = ops.operations[0].nextAttemptLcl ?? ops.operations[0].nextRetryLcl;
 
-        const ctx2 = buildClusterContext({}, { lclSeqNo: nextRetryLcl, ...hpOverrides });
-        await ctx2.init();
-        await ctx2.deinit();
+        await runClusterUntilSettled({}, { lclSeqNo: nextRetryLcl, ...hpOverrides }, 20);
 
         ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 0);

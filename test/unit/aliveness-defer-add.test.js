@@ -4,7 +4,7 @@ const fs = require('fs');
 
 const { OperationType } = require('../../dist/models/cluster');
 const { createWorkDir } = require('./test-workdir');
-const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, buildClusterContext } = require('./cluster-test-helpers');
+const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, buildClusterContext, runClusterUntilSettled } = require('./cluster-test-helpers');
 
 const DEAD_PUBKEY = 'dead_node_pubkey_aliveness_test';
 const PENDING_REF = 'pending_acquire_aliveness_ref';
@@ -47,7 +47,7 @@ describe('Fix 5: pending aliveness defers ADD only', () => {
     });
 
     it('processes REMOVE while a pending-node aliveness check runs (ADD stays queued)', async () => {
-        const ctx = buildClusterContext({
+        await runClusterUntilSettled({
             getIfAcquired: (refId) => {
                 if (refId !== PENDING_REF) return null;
                 return {
@@ -64,16 +64,11 @@ describe('Fix 5: pending aliveness defers ADD only', () => {
             acquireNode: async () => {
                 throw new Error('ADD must be deferred during aliveness check');
             },
-        }, { lclSeqNo: 200 });
-
-        await ctx.init();
-        await ctx.deinit();
+        }, { lclSeqNo: 200 }, 15);
 
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 2);
+        assert.strictEqual(ops.operations.length, 1);
         assert.strictEqual(ops.operations[0].type, OperationType.ADD_NODE);
-        assert.strictEqual(ops.operations[1].type, OperationType.REMOVE_NODE);
-        assert.ok((ops.operations[1].attempt ?? ops.operations[1].retryCount ?? 0) >= 1);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(!cluster.nodes.some((n) => n.pubkey === DEAD_PUBKEY));

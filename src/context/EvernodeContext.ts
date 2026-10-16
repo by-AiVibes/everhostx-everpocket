@@ -156,7 +156,16 @@ class EvernodeContext {
                 remove = true;
             }
             // Abandon waiting for this node if threshold reached.
-            else if (item.acquireSentOnLcl < (this.hpContext.lclSeqNo - ACQUIRE_ABANDON_LCL_THRESHOLD)) {
+            else if (item.acquireLedgerCap
+                && this.xrplContext.getValidatedLedgerIndex() >= item.acquireLedgerCap) {
+                const tx = await this.xrplContext.getTxAt(item.refId, item.acquireLedgerCap);
+                if (!tx || tx.resultCode !== 'tesSUCCESS') {
+                    log(`Acquire ${item.refId} failed or missing at cap ${item.acquireLedgerCap}; abandoning pending.`);
+                    remove = true;
+                }
+            }
+            else if (!item.acquireLedgerCap
+                && item.acquireSentOnLcl < (this.hpContext.lclSeqNo - ACQUIRE_ABANDON_LCL_THRESHOLD)) {
                 log(`Maximum acquire wait threshold reached, Abandoning waiting for ${item.refId}.`);
                 remove = true;
             }
@@ -261,6 +270,14 @@ class EvernodeContext {
      * @param acquireRefId Acquire reference.
      * @returns Pending node.
      */
+    public getLeaseStateAt(acquireRefId: string): 'acquired' | 'pending' | 'unknown' {
+        if (this.getIfAcquired(acquireRefId))
+            return 'acquired';
+        if (this.getIfPending(acquireRefId))
+            return 'pending';
+        return 'unknown';
+    }
+
     public getIfPending(acquireRefId: string): PendingAcquire | null {
         const node = this.acquireData.pendingAcquires.find(n => n.refId == acquireRefId);
         return node ? node : null;

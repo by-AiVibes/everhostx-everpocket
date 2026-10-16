@@ -158,8 +158,16 @@ describe('Operation agreed-state guards (behavioral)', () => {
                 throw new Error('peer update failed');
             },
         });
-        await ctx.init();
-        await ctx.deinit();
+        const { runClusterUntilSettled } = require('./cluster-test-helpers');
+        await runClusterUntilSettled({
+            getIfAcquired: () => null,
+            getIfPending: () => false,
+        }, {
+            ...hpOverrides,
+            updatePeers: async () => {
+                throw new Error('peer update failed');
+            },
+        }, 20);
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(!cluster.nodes.some((n) => n.pubkey === REMOVE_PUBKEY));
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
@@ -188,7 +196,7 @@ describe('Operation agreed-state guards (behavioral)', () => {
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
         const node = JSON.parse(fs.readFileSync('cluster.json', 'utf8')).nodes[0];
-        assert.ok(node.lifeMoments > 1);
+        assert.strictEqual(node.lifeMoments, 1);
     });
 });
 

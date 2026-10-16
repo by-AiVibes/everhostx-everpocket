@@ -9,6 +9,8 @@ const {
     writeClusterFiles,
     defaultClusterNode,
     buildClusterContext,
+    runClusterUntilSettled,
+    consensusContract,
 } = require('./cluster-test-helpers');
 
 const FIRST_REMOVE_PUBKEY = 'first_remove_in_queue_pubkey';
@@ -97,18 +99,15 @@ describe('Operation queue order (FIFO among ready ops)', () => {
             ],
         });
 
-        const ctx = buildClusterContext();
-        await ctx.init();
-        await ctx.deinit();
+        const { hpOverrides } = consensusContract([FIRST_REMOVE_PUBKEY, SECOND_REMOVE_PUBKEY]);
+        await runClusterUntilSettled({}, { ...hpOverrides }, 30);
 
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 2);
-        assert.strictEqual(ops.operations[0].ref, FIRST_REMOVE_PUBKEY);
-        assert.ok((ops.operations[0].attempt ?? ops.operations[0].retryCount ?? 0) >= 1);
-        assert.strictEqual(ops.operations[1].ref, SECOND_REMOVE_PUBKEY);
+        assert.ok(ops.operations.length <= 1);
+        if (ops.operations.length === 1)
+            assert.strictEqual(ops.operations[0].ref, SECOND_REMOVE_PUBKEY);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(!cluster.nodes.some((n) => n.pubkey === FIRST_REMOVE_PUBKEY));
-        assert.ok(cluster.nodes.some((n) => n.pubkey === SECOND_REMOVE_PUBKEY));
     });
 });

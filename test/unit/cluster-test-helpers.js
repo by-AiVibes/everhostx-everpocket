@@ -101,6 +101,18 @@ async function runClusterRound(evernodeOverrides, hpOverrides) {
     await ctx.deinit();
 }
 
+async function runClusterUntilSettled(evernodeOverrides, hpOverrides = {}, maxRounds = 30) {
+    let lcl = hpOverrides.lclSeqNo ?? 100;
+    for (let i = 0; i < maxRounds; i++) {
+        await runClusterRound(evernodeOverrides, { ...hpOverrides, lclSeqNo: lcl });
+        lcl += 4;
+        const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        if (ops.operations.length === 0)
+            return i + 1;
+    }
+    return maxRounds;
+}
+
 /**
  * Simulates Evernode pending/acquired lookups keyed by transaction hash refId.
  */
@@ -156,8 +168,10 @@ module.exports = {
     consensusContract,
     createAcquireTxHarness,
     writeAcquiresFile,
+    readAcquiresFile,
     writeClusterFiles,
     defaultClusterNode,
     buildClusterContext,
     runClusterRound,
+    runClusterUntilSettled,
 };
