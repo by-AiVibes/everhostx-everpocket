@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { buildClusterContext, writeAcquiresFile, TENANT_ADDRESS, DEFAULT_TENANT_SEQUENCE } = require('./cluster-test-helpers');
 const { unlPubkey, fakeUsersCollection } = require('./consensus-input-helpers');
@@ -17,6 +18,14 @@ const phase = process.env.EVP_PHASE || 'exec';
 const EXTEND_PUBKEY = 'sim_extend_pubkey';
 const CHECKPOINT_INTERVAL = 10;
 const CHECKPOINT_WINDOW = 3;
+
+function signedExtendTxHash(seed, sequence, ref) {
+    return crypto.createHash('sha512')
+        .update(`ExtendLease|${seed}|${sequence}|${ref}`)
+        .digest('hex')
+        .slice(0, 64)
+        .toUpperCase();
+}
 
 function shouldFailSubmit(s, nodeIndex, r) {
     const mix = (s * 31 + nodeIndex * 17 + r * 13) % 5;
@@ -79,7 +88,7 @@ async function main() {
             if (shouldFailSubmit(seed, Number(nodeId.replace('n', '')), round))
                 throw new Error(`sim extend fail ${nodeId} r${round}`);
             const lls = options?.txSubmitInfo?.maxLedgerSequence ?? pin?.lastLedgerSequence ?? buildLastLedgerSequence(anchor);
-            const hash = options?.pinnedExtendTxHash ?? pin?.txHash ?? ledgerApi.realTxHash(seed, round, nodeId, seq, ref);
+            const hash = signedExtendTxHash(seed, seq, ref);
             ledgerApi.recordSubmitIntent({
                 ref,
                 hash,
@@ -91,7 +100,11 @@ async function main() {
         },
         xrplContext: {
             getValidatedLedgerIndex: () => ledgerApi.getValidatedLedgerIndex(),
-            getTxAt: (h, idx) => ledgerApi.getTxAt(h, idx),
+            getTxAt: (h, idx) => {
+                if (process.env.EVP_GET_TX_AT_NULL === '1')
+                    return Promise.resolve(null);
+                return ledgerApi.getTxAt(h, idx);
+            },
             getSignerListAt: (idx) => ledgerApi.getSignerListAt(idx),
             getAccountSequenceAt: (acc, idx) => ledgerApi.getAccountSequenceAt(acc, idx),
             getLedgerHashAt: (idx) => ledgerApi.getLedgerHashAt(idx),

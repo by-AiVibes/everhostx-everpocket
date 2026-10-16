@@ -1,7 +1,6 @@
 import { createHash } from 'crypto';
 import { FrozenRoundSnapshot } from './RoundSnapshot';
-import { ExtendNodeOperation, Operation, OperationData } from '../models/cluster';
-import { getPinnedExtendTx, hashExtendCanonical } from './ExtendPinning';
+import { ExtendNodeOperation, Operation } from '../models/cluster';
 
 /** LastLedgerSequence window above agreed anchor ledger. */
 export const LLS_LEDGER_WINDOW = 30;
@@ -73,14 +72,16 @@ export function extendTxCanonicalFields(
     };
 }
 
-export function computeExtendTxHash(
-    snap: FrozenRoundSnapshot,
-    operation: Operation,
-    operationData?: OperationData,
-): string {
-    const pin = operationData ? getPinnedExtendTx(operationData, operation.ref) : undefined;
-    if (pin)
-        return pin.txHash;
+function hashExtendCanonical(canonical: Record<string, string | number>): string {
+    const keys = Object.keys(canonical).sort();
+    const ordered: Record<string, string | number> = {};
+    for (const k of keys)
+        ordered[k] = canonical[k];
+    return `0x${createHash('sha256').update(JSON.stringify(ordered)).digest('hex')}`;
+}
+
+/** Test / documentation helper only — production completion uses quorum-reported signed tx hashes. */
+export function computeExtendTxHash(snap: FrozenRoundSnapshot, operation: Operation): string {
     return hashExtendCanonical(extendTxCanonicalFields(snap, operation));
 }
 

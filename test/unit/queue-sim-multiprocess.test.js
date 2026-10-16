@@ -153,13 +153,15 @@ describe('queue-sim multiprocess (phase 1)', () => {
                 mergePartialObservations(seedRoot, seed, round);
 
                 const results = [];
-                for (const d of dirs)
-                    results.push(await runChild(seedRoot, d, seed, round, lcl, 'exec'));
+                for (const d of dirs) {
+                    const extra = d === 'n2' ? { EVP_GET_TX_AT_NULL: '1' } : {};
+                    results.push(await runChild(seedRoot, d, seed, round, lcl, 'exec', extra));
+                }
                 assert.strictEqual(results.length, NODE_COUNT);
+                for (const r of results)
+                    assert.strictEqual(r.aborted, false, `seed ${seed} r${round}: round must not abort`);
 
-                const hashes = dirs
-                    .filter((_, i) => !results[i].aborted)
-                    .map((d) => stateSha256(path.join(seedRoot, d)));
+                const hashes = dirs.map((d) => stateSha256(path.join(seedRoot, d)));
                 assert.ok(hashes.length > 0);
                 const first = hashes[0];
                 for (const h of hashes)
@@ -177,6 +179,12 @@ describe('queue-sim multiprocess (phase 1)', () => {
             for (const ref of EXTEND_REFS) {
                 assert.strictEqual(ledger.landedCountByRef[ref] ?? 0, 1,
                     `seed ${seed}: expected exactly one landed extend tx for ${ref}`);
+            }
+            for (const d of dirs) {
+                const ops = JSON.parse(fs.readFileSync(path.join(seedRoot, d, 'operations.json'), 'utf8'));
+                const pendingExtend = ops.operations.filter((o) => o.type === OperationType.EXTEND_NODE);
+                assert.strictEqual(pendingExtend.length, 0,
+                    `seed ${seed} ${d}: all extend ops must complete`);
             }
         }
     });

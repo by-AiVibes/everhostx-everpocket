@@ -1,5 +1,5 @@
-import { createHash } from 'crypto';
 import { FrozenRoundSnapshot } from './RoundSnapshot';
+import { ExtendLedgerCheck } from './RoundSnapshot';
 import {
     ExtendNodeOperation,
     Operation,
@@ -14,41 +14,15 @@ import {
 } from './DeterministicTx';
 
 export interface PinnedExtendTx {
+    tenantAddress: string;
     sequence: number;
     lastLedgerSequence: number;
     fee: string;
     host: string;
-    txHash: string;
     anchorLedger: number;
-}
-
-export function extendCanonicalFromPin(
-    snap: FrozenRoundSnapshot,
-    operation: Operation,
-    pin: PinnedExtendTx,
-): Record<string, string | number> {
-    const data = operation.data as ExtendNodeOperation;
-    const snapNode = snap.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
-    if (!snapNode?.name)
-        throw new Error('Missing lease token id in round snapshot');
-    return {
-        account: snap.tenantAddress,
-        sequence: pin.sequence,
-        lastLedgerSequence: pin.lastLedgerSequence,
-        fee: pin.fee,
-        host: pin.host,
-        nodePubkey: data.nodePubkey,
-        moments: data.moments,
-        tokenId: snapNode.name,
-    };
-}
-
-export function hashExtendCanonical(canonical: Record<string, string | number>): string {
-    const keys = Object.keys(canonical).sort();
-    const ordered: Record<string, string | number> = {};
-    for (const k of keys)
-        ordered[k] = canonical[k];
-    return `0x${createHash('sha256').update(JSON.stringify(ordered)).digest('hex')}`;
+    nodePubkey: string;
+    moments: number;
+    tokenId: string;
 }
 
 export function nextExtendSequenceForPin(operationData: OperationData, snap: FrozenRoundSnapshot): number {
@@ -64,28 +38,22 @@ export function buildPinnedExtendTx(
     operation: Operation,
     operationData: OperationData,
 ): PinnedExtendTx {
+    const data = operation.data as ExtendNodeOperation;
+    const snapNode = snap.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
+    if (!snapNode?.name)
+        throw new Error('Missing lease token id for extend pin');
     const host = pickHostForOpRef(snap, operation.ref);
     const sequence = nextExtendSequenceForPin(operationData, snap);
-    const canonical = {
-        account: snap.tenantAddress,
+    return {
+        tenantAddress: snap.tenantAddress,
         sequence,
         lastLedgerSequence: buildLastLedgerSequenceFromSnapshot(snap),
         fee: readFeeCeiling(snap),
         host,
-        nodePubkey: (operation.data as ExtendNodeOperation).nodePubkey,
-        moments: (operation.data as ExtendNodeOperation).moments,
-        tokenId: snap.cluster.nodes.find((n) => n.pubkey === (operation.data as ExtendNodeOperation).nodePubkey)?.name ?? '',
-    };
-    if (!canonical.tokenId)
-        throw new Error('Missing lease token id for extend pin');
-    const txHash = hashExtendCanonical(canonical);
-    return {
-        sequence: canonical.sequence,
-        lastLedgerSequence: canonical.lastLedgerSequence,
-        fee: canonical.fee,
-        host,
-        txHash,
         anchorLedger: snap.anchorLedger,
+        nodePubkey: data.nodePubkey,
+        moments: data.moments,
+        tokenId: snapNode.name,
     };
 }
 
@@ -123,6 +91,19 @@ export function findInFlightExtendRef(operationData: OperationData, anchorLedger
     return null;
 }
 
+export function quorumExtendCompletesOp(operationData: OperationData, operation: Operation): boolean {
+    const pin = getPinnedExtendTx(operationData, operation.ref);
+    if (!pin)
+        return false;
+    const agreed = operationData.agreedExtendResults?.[operation.ref];
+    if (!agreed || agreed.resultCode !== 'tesSUCCESS')
+        return false;
+    if (agreed.lastLedgerSequence !== pin.lastLedgerSequence)
+        return false;
+    const data = operation.data as ExtendNodeOperation;
+    return data.nodePubkey === pin.nodePubkey && data.moments === pin.moments;
+}
+
 export function detectPinnedExtendConflict(
     operationData: OperationData,
     operation: Operation,
@@ -130,18 +111,48 @@ export function detectPinnedExtendConflict(
     const pin = getPinnedExtendTx(operationData, operation.ref);
     if (!pin)
         return null;
-    const agreed = operationData.agreedTenantSequence;
-    if (agreed === undefined || agreed <= pin.sequence)
-        return null;
-    const agreedResult = operationData.agreedExtendResults?.[operation.ref];
-    if (agreedResult?.resultCode === 'tesSUCCESS' && agreedResult.hash !== pin.txHash)
-        return `pinned sequence ${pin.sequence} consumed by quorum tx ${agreedResult.hash}`;
+    const agreed = operationData.agreedExtendResults?.[operation.ref];
+    if (agreed?.resultCode === 'tesSUCCESS' && agreed.lastLedgerSequence !== pin.lastLedgerSequence)
+        return `quorum extend LLS ${agreed.lastLedgerSequence} != pin ${pin.lastLedgerSequence}`;
+    const tenantSeq = operationData.agreedTenantSequence;
+    if (tenantSeq !== undefined && tenantSeq > pin.sequence) {
+        if (!agreed || agreed.resultCode !== 'tesSUCCESS')
+            return `tenant sequence ${pin.sequence} consumed without quorum tesSUCCESS for ${operation.ref}`;
+        const data = operation.data as ExtendNodeOperation;
+        if (data.nodePubkey !== pin.nodePubkey || data.moments !== pin.moments)
+            return `quorum extend consumed sequence ${pin.sequence} with non-matching op fields`;
+    }
     return null;
 }
 
-/**
- * Create or return the agreed pin for this op. Returns null when another extend is in flight.
- */
+export function buildExtendLedgerChecksFromQuorum(
+    operationData: OperationData,
+    operations: Operation[],
+): ExtendLedgerCheck[] {
+    const checks: ExtendLedgerCheck[] = [];
+    for (const op of operations) {
+        if (op.type !== OperationType.EXTEND_NODE)
+            continue;
+        const pin = getPinnedExtendTx(operationData, op.ref);
+        const agreed = operationData.agreedExtendResults?.[op.ref];
+        let tx = null;
+        if (quorumExtendCompletesOp(operationData, op) && agreed) {
+            tx = {
+                hash: agreed.hash,
+                resultCode: 'tesSUCCESS',
+                lastLedgerSequence: agreed.lastLedgerSequence,
+            };
+        }
+        checks.push({
+            ref: op.ref,
+            hash: agreed?.hash ?? '',
+            lastLedgerSequence: pin?.lastLedgerSequence ?? agreed?.lastLedgerSequence ?? 0,
+            tx,
+        });
+    }
+    return checks;
+}
+
 export function ensurePinnedExtendTx(
     operationData: OperationData,
     operation: Operation,

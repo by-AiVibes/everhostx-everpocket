@@ -159,9 +159,10 @@ describe('Phase 1 queue core', () => {
         assert.strictEqual(node.lifeMoments, 1);
     });
 
-    it('dequeues EXTEND when ledger reports tesSUCCESS for pinned tx hash', async () => {
+    it('dequeues EXTEND when quorum agreedExtendResults report tesSUCCESS for pinned op', async () => {
         const { buildPinnedExtendTx } = require('../../dist/cluster/ExtendPinning');
         const lls = DEFAULT_ANCHOR + 30;
+        const signedHash = 'A1B2C3D4E5F60718293A4B5C6D7E8F9012345678901234567890ABCDEF123456';
         const nodes = [{
             ...defaultClusterNode(EXTEND_PUBKEY),
             lifeMoments: 1,
@@ -191,17 +192,19 @@ describe('Phase 1 queue core', () => {
         writeClusterFiles({
             nodes,
             anchorLedger: DEFAULT_ANCHOR,
-            agreedTenantSequence: 42,
+            agreedTenantSequence: 43,
             operations: [op],
             pinnedExtendTxs: { [EXTEND_PUBKEY]: pin },
+            agreedExtendResults: {
+                [EXTEND_PUBKEY]: {
+                    hash: signedHash,
+                    lastLedgerSequence: lls,
+                    resultCode: 'tesSUCCESS',
+                },
+            },
         });
         const ctx = buildClusterContext({
             xrplContext: {
-                getTxAt: async (hash, idx) => (
-                    hash === pin.txHash && idx === lls
-                        ? { resultCode: 'tesSUCCESS', lastLedgerSequence: lls }
-                        : null
-                ),
                 getValidatedLedgerIndex: () => DEFAULT_ANCHOR + 30,
             },
         });

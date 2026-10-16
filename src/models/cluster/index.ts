@@ -100,12 +100,15 @@ export interface OperationData {
   consumedTenantSequences?: number[];
   /** Agreed extend tx fields pinned on first attempt (hash stable across retries). */
   pinnedExtendTxs?: Record<string, {
+    tenantAddress: string;
     sequence: number;
     lastLedgerSequence: number;
     fee: string;
     host: string;
-    txHash: string;
     anchorLedger: number;
+    nodePubkey: string;
+    moments: number;
+    tokenId: string;
   }>;
 }
 

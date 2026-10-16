@@ -48,6 +48,7 @@ function writeClusterFiles({
     anchorLedger = DEFAULT_ANCHOR,
     agreedTenantSequence = DEFAULT_TENANT_SEQUENCE,
     pinnedExtendTxs,
+    agreedExtendResults,
 }) {
     fs.writeFileSync('cluster.json', JSON.stringify({
         initialized: true,
@@ -61,6 +62,8 @@ function writeClusterFiles({
     };
     if (pinnedExtendTxs)
         opsPayload.pinnedExtendTxs = pinnedExtendTxs;
+    if (agreedExtendResults)
+        opsPayload.agreedExtendResults = agreedExtendResults;
     fs.writeFileSync('operations.json', JSON.stringify(opsPayload, null, 4));
 }
 

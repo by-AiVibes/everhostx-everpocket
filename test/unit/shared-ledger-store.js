@@ -120,8 +120,13 @@ function ledgerBackendFromPinned(root, round, nodeId) {
             return data.ledgerHashes?.[ledgerIndex] ?? null;
         },
         getPendingSubmitsForNode: () => {
-            const data = read();
-            return data.nodePendingSubmits[nodeId] ?? [];
+            const live = readLedger(root);
+            const byRef = new Map();
+            for (const list of Object.values(live.nodePendingSubmits || {})) {
+                for (const tx of list)
+                    byRef.set(`${tx.ref}|${tx.hash}`, tx);
+            }
+            return [...byRef.values()];
         },
         recordSubmitIntent: ({ ref, hash, lastLedgerSequence, sequence, tenantAddress }) => {
             const ledger = readLedger(root);

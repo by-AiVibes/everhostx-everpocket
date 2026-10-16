@@ -71,7 +71,8 @@ describe('extend pin and local read gates', () => {
         await ctx2.init();
         await ctx2.deinit();
         const pin2 = JSON.parse(fs.readFileSync('operations.json', 'utf8')).pinnedExtendTxs[EXTEND_PUBKEY];
-        assert.strictEqual(pin2.txHash, pin.txHash);
+        assert.strictEqual(pin2.sequence, pin.sequence);
+        assert.strictEqual(pin2.lastLedgerSequence, pin.lastLedgerSequence);
         assert.strictEqual(sequences[1], pin.sequence);
     });
 

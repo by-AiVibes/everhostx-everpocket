@@ -23,6 +23,7 @@ import { applyObservationInputs, parseAnchorUserMessage, ANCHOR_OBSERVATION_MESS
 import { requireMaxInputLedgerOffset } from "../cluster/QueueConfig";
 import { readTenantSequence, txSubmitInfoFromPinnedExtend } from "../cluster/DeterministicTx";
 import {
+    buildExtendLedgerChecksFromQuorum,
     clearPinnedExtendTx,
     detectPinnedExtendConflict,
     ensurePinnedExtendTx,
@@ -233,26 +234,10 @@ class ClusterContext {
             hostList: evernodeCfg.hosts,
         };
 
-        const ledger = this.#ledgerReader();
-        const extendLedgerChecks = [];
-        for (const op of operationDataCopy.operations) {
-            if (op.type !== OperationType.EXTEND_NODE)
-                continue;
-            const pin = this.operationData.pinnedExtendTxs?.[op.ref];
-            const hash = pin?.txHash ?? '';
-            const lls = pin?.lastLedgerSequence ?? 0;
-            let tx = null;
-            if (pin && hash) {
-                const ledgerTx = await ledger.getTxAt(hash, lls);
-                if (ledgerTx?.resultCode === 'tesSUCCESS')
-                    tx = {
-                        hash,
-                        resultCode: 'tesSUCCESS',
-                        lastLedgerSequence: lls,
-                    };
-            }
-            extendLedgerChecks.push({ ref: op.ref, hash, lastLedgerSequence: lls, tx });
-        }
+        const extendLedgerChecks = buildExtendLedgerChecksFromQuorum(
+            this.operationData,
+            operationDataCopy.operations,
+        );
 
         return RoundSnapshot.capture({
             lclSeqNo: this.hpContext.lclSeqNo,
@@ -387,7 +372,6 @@ class ClusterContext {
             txSubmitInfo: txSubmitInfoFromPinnedExtend(pin),
             extendOpRef: operation.ref,
             extendSequence: seq,
-            pinnedExtendTxHash: pin.txHash,
         });
         return 'submitted';
     }
