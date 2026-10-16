@@ -114,8 +114,10 @@ describe('Operation retry guards (regression)', () => {
         await ctx.deinit();
 
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 1);
+        assert.strictEqual(ops.operations.length, 2);
         assert.strictEqual(ops.operations[0].ref, BLOCKED_PUBKEY);
+        assert.strictEqual(ops.operations[1].ref, READY_PUBKEY);
+        assert.ok((ops.operations[1].retryCount || 0) >= 1);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(!cluster.nodes.some((n) => n.pubkey === READY_PUBKEY));
@@ -153,9 +155,23 @@ describe('Operation retry guards (regression)', () => {
             operations: ops.operations,
         });
 
-        const ctx2 = buildClusterContext({}, { lclSeqNo: nextRetryLcl, ...hpOverrides });
+        const ctx2 = buildClusterContext({
+            getIfAcquired: () => null,
+            getIfPending: () => false,
+        }, { lclSeqNo: nextRetryLcl, ...hpOverrides });
         await ctx2.init();
         await ctx2.deinit();
+
+        ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.strictEqual(ops.operations.length, 1);
+        const nextRetryLcl2 = ops.operations[0].nextRetryLcl;
+
+        const ctx3 = buildClusterContext({
+            getIfAcquired: () => null,
+            getIfPending: () => false,
+        }, { lclSeqNo: nextRetryLcl2, ...hpOverrides });
+        await ctx3.init();
+        await ctx3.deinit();
 
         ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 0);

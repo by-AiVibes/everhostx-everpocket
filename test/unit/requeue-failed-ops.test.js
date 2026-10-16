@@ -74,11 +74,20 @@ describe('Fix 1: re-queue failed operations with retry metadata', () => {
             nodes: [defaultClusterNode(DEAD_PUBKEY)],
         });
 
-        const ctx = buildClusterContext({}, consensusContract([DEAD_PUBKEY]).hpOverrides);
-        await ctx.init();
-        await ctx.deinit();
+        const { hpOverrides } = consensusContract([DEAD_PUBKEY]);
+        const ctx1 = buildClusterContext({}, { lclSeqNo: 100, ...hpOverrides });
+        await ctx1.init();
+        await ctx1.deinit();
 
-        const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        let ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.strictEqual(ops.operations.length, 1);
+        const nextRetryLcl = ops.operations[0].nextRetryLcl;
+
+        const ctx2 = buildClusterContext({}, { lclSeqNo: nextRetryLcl, ...hpOverrides });
+        await ctx2.init();
+        await ctx2.deinit();
+
+        ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 0);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));

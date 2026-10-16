@@ -65,9 +65,11 @@ describe('Operation queue order (FIFO among ready ops)', () => {
         assert.strictEqual(acquireCalls, 1);
 
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 1);
-        assert.strictEqual(ops.operations[0].type, OperationType.REMOVE_NODE);
-        assert.strictEqual(ops.operations[0].ref, SECOND_REMOVE_PUBKEY);
+        assert.strictEqual(ops.operations.length, 2);
+        assert.strictEqual(ops.operations[0].type, OperationType.ADD_NODE);
+        assert.ok((ops.operations[0].retryCount || 0) >= 1);
+        assert.strictEqual(ops.operations[1].type, OperationType.REMOVE_NODE);
+        assert.strictEqual(ops.operations[1].ref, SECOND_REMOVE_PUBKEY);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(cluster.nodes.some((n) => n.pubkey === SECOND_REMOVE_PUBKEY));
@@ -100,8 +102,10 @@ describe('Operation queue order (FIFO among ready ops)', () => {
         await ctx.deinit();
 
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 1);
-        assert.strictEqual(ops.operations[0].ref, SECOND_REMOVE_PUBKEY);
+        assert.strictEqual(ops.operations.length, 2);
+        assert.strictEqual(ops.operations[0].ref, FIRST_REMOVE_PUBKEY);
+        assert.ok((ops.operations[0].retryCount || 0) >= 1);
+        assert.strictEqual(ops.operations[1].ref, SECOND_REMOVE_PUBKEY);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(!cluster.nodes.some((n) => n.pubkey === FIRST_REMOVE_PUBKEY));

@@ -1,9 +1,25 @@
-const { describe, it } = require('node:test');
+const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
 
 const XrplContext = require('../../dist/context/XrplContext').default;
+const { createWorkDir } = require('./test-workdir');
 
 describe('replaceSignerList deep copy (cache safety)', () => {
+    let tmpDir;
+    let originalCwd;
+
+    beforeEach(() => {
+        originalCwd = process.cwd();
+        tmpDir = createWorkDir('evp-xrpl-signer-copy');
+        process.chdir(tmpDir);
+    });
+
+    afterEach(() => {
+        process.chdir(originalCwd);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
     it('does not mutate cached signerList before the ledger tx succeeds', async () => {
         const cached = {
             signerQuorum: 2,

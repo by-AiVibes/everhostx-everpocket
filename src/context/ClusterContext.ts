@@ -22,6 +22,15 @@ const MAX_SIGNER_REPLACE_ATTEMPTS = 10;
 const MAX_OPERATION_RETRY_ATTEMPTS = 32;
 const TIMEOUT = 10000;
 
+type RoundAgreedState = {
+    unl: string[];
+    clusterNodePubkeys: Set<string>;
+    pendingAcquireRefIds: Set<string>;
+    nodeLifeMoments: Map<string, number>;
+    nodeTargetLifeMoments: Map<string, number>;
+    ledgerSignerAccounts: Set<string>;
+};
+
 class ClusterContext {
     private operationDataFile: string = "operations.json";
     private nodePrivateInfoFile: string = "../node_private_info.json";
@@ -154,24 +163,36 @@ class ClusterContext {
         return -1;
     }
 
-    #signerAddressOnLedger(signerAddress: string): boolean {
-        const signerList = this.evernodeContext.xrplContext.getSignerList();
-        return !!signerList?.signerList?.some(s => s.account === signerAddress);
+    async #captureRoundAgreedState(): Promise<RoundAgreedState> {
+        const config = await this.hpContext.getContractConfig();
+        const signerList = this.evernodeContext.xrplContext.getSignerList?.() ?? null;
+        const ledgerSignerAccounts = new Set(
+            (signerList?.signerList || []).map((s) => s.account),
+        );
+        const nodes = this.getClusterNodes();
+        return {
+            unl: [...config.unl],
+            clusterNodePubkeys: new Set(nodes.map((n) => n.pubkey)),
+            pendingAcquireRefIds: new Set(this.getPendingNodes().map((p) => p.refId)),
+            nodeLifeMoments: new Map(nodes.map((n) => [n.pubkey, n.lifeMoments])),
+            nodeTargetLifeMoments: new Map(nodes.map((n) => [n.pubkey, n.targetLifeMoments])),
+            ledgerSignerAccounts,
+        };
     }
 
-    async #isOperationCompleteInAgreedState(operation: Operation): Promise<boolean> {
+    #isOperationCompleteInAgreedState(operation: Operation, roundState: RoundAgreedState): boolean {
         if (operation.type === OperationType.REMOVE_NODE) {
             const pubkey = (operation.data as RemoveNodeOperation).nodePubkey;
-            const config = await this.hpContext.getContractConfig();
-            return config.unl.findIndex((p: string) => p === pubkey) === -1;
+            return !roundState.unl.includes(pubkey) && !roundState.clusterNodePubkeys.has(pubkey);
         }
         if (operation.type === OperationType.ADD_NODE) {
-            return this.getPendingNodes().length > 0;
+            return roundState.pendingAcquireRefIds.has(operation.ref);
         }
         if (operation.type === OperationType.EXTEND_NODE) {
             const data = operation.data as ExtendNodeOperation;
-            const node = this.clusterManager.getNode(data.nodePubkey);
-            return !!node && node.lifeMoments >= node.targetLifeMoments;
+            const life = roundState.nodeLifeMoments.get(data.nodePubkey);
+            const target = roundState.nodeTargetLifeMoments.get(data.nodePubkey);
+            return life !== undefined && target !== undefined && life >= target;
         }
         return false;
     }
@@ -190,12 +211,13 @@ class ClusterContext {
     }
 
 
-    async #performOperation(operation: Operation): Promise<void> {
+    async #performOperation(operation: Operation, roundState: RoundAgreedState): Promise<void> {
             if (operation.type === OperationType.ADD_NODE) {
                 const data = operation.data as AddNodeOperation;
 
                 log(`Acquiring a new node...`);
                 let acquire = (await this.evernodeContext.acquireNode(data.acquireOptions)) as PendingNode;
+                acquire.refId = operation.ref;
                 acquire.targetLifeMoments = data.lifeMoments;
                 acquire.maxLifeMoments = data.maxLifeMoments;
                 acquire.aliveCheckCount = 0;
@@ -226,7 +248,7 @@ class ClusterContext {
 
                 log(`Removing the node ${pubkey}...`);
 
-                if (node?.signerAddress && this.#signerAddressOnLedger(node.signerAddress)) {
+                if (node?.signerAddress && roundState.ledgerSignerAccounts.has(node.signerAddress)) {
                     const nonQuorumNodes = this.getClusterUnlNodes().filter(n => !n.signerAddress);
 
                     if (nonQuorumNodes.length > 0 && (node?.signerReplaceFailedAttempts || 0) < MAX_SIGNER_REPLACE_ATTEMPTS) {
@@ -324,25 +346,26 @@ class ClusterContext {
         if (this.operationData.operations.length === 0)
             return;
 
+        const roundState = await this.#captureRoundAgreedState();
         const curLcl = this.hpContext.lclSeqNo;
         const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl);
         if (operationIndex < 0)
             return;
 
         const operation = this.operationData.operations[operationIndex];
+        const completeInAgreedState = this.#isOperationCompleteInAgreedState(operation, roundState);
 
         info(`Operations processor started.`);
 
-        try {
-            await this.#performOperation(operation);
-        } catch (e) {
-            error(e);
-        }
-
-        if (await this.#isOperationCompleteInAgreedState(operation)) {
+        if (completeInAgreedState) {
             this.operationData.operations.splice(operationIndex, 1);
             this.updatedData = true;
         } else {
+            try {
+                await this.#performOperation(operation, roundState);
+            } catch (e) {
+                error(e);
+            }
             this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
         }
 

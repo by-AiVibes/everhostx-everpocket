@@ -108,6 +108,13 @@ describe('REMOVE signer step idempotency', () => {
         assert.strictEqual(ops.operations.length, 1);
         const nextRetryLcl = ops.operations[0].nextRetryLcl;
 
+        sharedConfig.unl = ['non_quorum_helper_pubkey'];
+        writeClusterFiles({
+            nodes: [{ ...defaultClusterNode('non_quorum_helper_pubkey'), isUnl: true }],
+            pendingNodes: [],
+            operations: ops.operations,
+        });
+
         const ctx2 = makeContext(nextRetryLcl);
         await ctx2.init();
         await ctx2.deinit();

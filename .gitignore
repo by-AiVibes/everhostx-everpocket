@@ -4,4 +4,4 @@ test/cluster.json
 test/operations.json
 **/dist/**
 !hp.cfg.override
-!streamer.config
+!streamer.configtest/transactions.json

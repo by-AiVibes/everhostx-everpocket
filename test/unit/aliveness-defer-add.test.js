@@ -70,8 +70,10 @@ describe('Fix 5: pending aliveness defers ADD only', () => {
         await ctx.deinit();
 
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 1);
+        assert.strictEqual(ops.operations.length, 2);
         assert.strictEqual(ops.operations[0].type, OperationType.ADD_NODE);
+        assert.strictEqual(ops.operations[1].type, OperationType.REMOVE_NODE);
+        assert.ok((ops.operations[1].retryCount || 0) >= 1);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(!cluster.nodes.some((n) => n.pubkey === DEAD_PUBKEY));
