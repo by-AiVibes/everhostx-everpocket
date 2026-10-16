@@ -336,6 +336,20 @@ class ClusterContext {
         if (this.operationData.consumedTenantSequences?.includes(seq))
             return;
 
+        const tenantAddress = snapshot.tenantAddress;
+        const onLedgerSeq = await this.evernodeContext.xrplContext.getAccountSequenceAtForObservation(
+            tenantAddress,
+            snapshot.anchorLedger,
+        );
+        if (onLedgerSeq !== null && onLedgerSeq > seq) {
+            if (!this.operationData.consumedTenantSequences)
+                this.operationData.consumedTenantSequences = [];
+            if (!this.operationData.consumedTenantSequences.includes(seq))
+                this.operationData.consumedTenantSequences.push(seq);
+            this.updatedData = true;
+            return;
+        }
+
         const data = operation.data as ExtendNodeOperation;
         const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
         if (!snapNode)

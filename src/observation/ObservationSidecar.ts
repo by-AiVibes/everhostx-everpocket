@@ -6,7 +6,7 @@ import { ObservationSubmitter } from './ObservationSubmitter';
 import { error } from '../helpers/logger';
 import XrplContext from '../context/XrplContext';
 import { buildAnchorObservationFromReader } from './ObservationPayloadBuilder';
-import { requireMaxInputLedgerOffset } from '../cluster/QueueConfig';
+import { requireCheckpointInterval, requireCheckpointWindow, requireMaxInputLedgerOffset } from '../cluster/QueueConfig';
 
 export type ObservationSidecarHooks = {
     submitPayload?: (payload: AnchorObservationPayload, peers: Peer[]) => Promise<void>;
@@ -32,9 +32,8 @@ export function scheduleObservationSubmit(
             if (!tenantAddress)
                 return;
 
-            const evernodeCfg = (config as {
-                evernode?: { checkpointInterval?: number; checkpointWindow?: number };
-            }).evernode;
+            const checkpointInterval = requireCheckpointInterval(config);
+            const checkpointWindow = requireCheckpointWindow(config);
 
             const reader = {
                 getValidatedLedgerIndex: () => xrplContext.getValidatedLedgerIndex(),
@@ -50,8 +49,8 @@ export function scheduleObservationSubmit(
                 nonce: hpContext.lclSeqNo,
                 tenantAddress,
                 submittedTx: [...pendingSubmits],
-                checkpointInterval: evernodeCfg?.checkpointInterval,
-                checkpointWindow: evernodeCfg?.checkpointWindow,
+                checkpointInterval,
+                checkpointWindow,
             });
             if (!payload)
                 return;

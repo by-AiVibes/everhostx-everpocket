@@ -3,12 +3,7 @@ import {
     ANCHOR_OBSERVATION_MESSAGE_TYPE,
     SubmittedTxObservation,
 } from '../cluster/AnchorObservation';
-import {
-    computeCheckpointIndexes,
-    DEFAULT_CHECKPOINT_INTERVAL,
-    DEFAULT_CHECKPOINT_WINDOW,
-    hashSignerList,
-} from './ObservationLedgerReads';
+import { computeCheckpointIndexes, hashSignerList } from './ObservationLedgerReads';
 import { SignerListInfo } from '../models';
 
 export type ObservationLedgerReader = {
@@ -24,16 +19,18 @@ export type ObservationReaderBuildParams = {
     nonce: number;
     tenantAddress: string;
     submittedTx: SubmittedTxObservation[];
-    checkpointInterval?: number;
-    checkpointWindow?: number;
+    checkpointInterval: number;
+    checkpointWindow: number;
 };
 
 export async function buildAnchorObservationFromReader(
     reader: ObservationLedgerReader,
     params: ObservationReaderBuildParams,
 ): Promise<AnchorObservationPayload | null> {
-    const interval = params.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
-    const window = params.checkpointWindow ?? DEFAULT_CHECKPOINT_WINDOW;
+    const interval = params.checkpointInterval;
+    const window = params.checkpointWindow;
+    if (!interval || !window)
+        throw new Error('Missing checkpointInterval or checkpointWindow');
     const latest = reader.getValidatedLedgerIndex();
     const indexes = computeCheckpointIndexes(latest, interval, window);
     const checkpoints: AnchorObservationPayload['checkpoints'] = [];

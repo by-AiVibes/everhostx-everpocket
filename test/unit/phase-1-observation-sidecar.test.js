@@ -36,6 +36,25 @@ describe('observation sidecar', () => {
         assert.strictEqual(payload.ledgerHash, ledgerHashAt(idx));
     });
 
+    it('throws when checkpoint interval or window missing in builder', async () => {
+        const reader = {
+            getValidatedLedgerIndex: () => 100,
+            getLedgerHashAt: async () => 'h',
+            getSignerListAt: async () => ({ signerQuorum: 1, signerList: [] }),
+            getAccountSequenceAt: async () => 1,
+        };
+        await assert.rejects(
+            () => buildAnchorObservationFromReader(reader, {
+                observedLcl: 1,
+                observedLclHash: 'h',
+                nonce: 1,
+                tenantAddress: TENANT_ADDRESS,
+                submittedTx: [],
+            }),
+            /Missing checkpointInterval or checkpointWindow/,
+        );
+    });
+
     it('skips observation when ledger hash read fails', async () => {
         const reader = {
             getValidatedLedgerIndex: () => 100,
@@ -49,6 +68,8 @@ describe('observation sidecar', () => {
             nonce: 1,
             tenantAddress: TENANT_ADDRESS,
             submittedTx: [],
+            checkpointInterval: 10,
+            checkpointWindow: 1,
         });
         assert.strictEqual(payload, null);
     });
@@ -67,6 +88,8 @@ describe('observation sidecar', () => {
                     feeCeiling: '1',
                     anchorLedger: DEFAULT_ANCHOR,
                     tenantSequence: DEFAULT_TENANT_SEQUENCE,
+                    checkpointInterval: 10,
+                    checkpointWindow: 1,
                 },
                 consensus: { roundtime: 1000, stage_slice: 100 },
                 max_input_ledger_offset: 32,

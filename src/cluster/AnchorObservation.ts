@@ -109,26 +109,48 @@ export function parseAnchorUserMessage(raw: Buffer | string): AnchorUserMessage 
     }
 }
 
-function countBy<T>(items: T[], keyFn: (t: T) => string): Map<string, number> {
-    const m = new Map<string, number>();
-    for (const item of items) {
-        const k = keyFn(item);
-        m.set(k, (m.get(k) || 0) + 1);
+function modeWithQuorumDistinctUnl(
+    observations: ParsedObservation[],
+    valueFn: (o: ParsedObservation) => string,
+    quorum: number,
+): string | null {
+    const valueToUnl = new Map<string, Set<string>>();
+    for (const o of observations) {
+        const v = valueFn(o);
+        const unl = o.unlPubkey.toLowerCase();
+        if (!valueToUnl.has(v))
+            valueToUnl.set(v, new Set());
+        valueToUnl.get(v)!.add(unl);
     }
-    return m;
-}
-
-function modeWithQuorum(values: string[], quorum: number): string | null {
-    const counts = countBy(values, (v) => v);
     let best: string | null = null;
     let bestCount = 0;
-    for (const [v, c] of counts) {
+    for (const [v, unls] of valueToUnl) {
+        const c = unls.size;
         if (c >= quorum && c > bestCount) {
             best = v;
             bestCount = c;
         }
     }
     return best;
+}
+
+export function normalizeObservationCheckpoints(msg: AnchorObservationPayload): ObservationCheckpointFields[] | null {
+    const points = (msg.checkpoints && msg.checkpoints.length > 0)
+        ? msg.checkpoints
+        : [{
+            validatedIndex: msg.validatedIndex,
+            ledgerHash: msg.ledgerHash,
+            tenantSequence: msg.tenantSequence,
+            signerListHash: msg.signerListHash,
+        }];
+
+    const byIndex = new Map<number, ObservationCheckpointFields>();
+    for (const cp of points) {
+        if (byIndex.has(cp.validatedIndex))
+            return null;
+        byIndex.set(cp.validatedIndex, cp);
+    }
+    return [...byIndex.values()];
 }
 
 export function isObservationStale(observedLcl: number, currentLcl: number, maxInputLedgerOffset: number): boolean {
@@ -164,9 +186,16 @@ function selectAnchorCandidate(observations: ParsedObservation[], quorum: number
 
     const candidates: { index: number; hash: string }[] = [];
     for (const [index, list] of indexToObs) {
-        const hashCounts = countBy(list, (o) => o.ledgerHash);
-        for (const [hash, count] of hashCounts) {
-            if (count >= quorum)
+        const hashToUnl = new Map<string, Set<string>>();
+        for (const o of list) {
+            const h = o.ledgerHash;
+            const unl = o.unlPubkey.toLowerCase();
+            if (!hashToUnl.has(h))
+                hashToUnl.set(h, new Set());
+            hashToUnl.get(h)!.add(unl);
+        }
+        for (const [hash, unls] of hashToUnl) {
+            if (unls.size >= quorum)
                 candidates.push({ index, hash });
         }
     }
@@ -176,7 +205,7 @@ function selectAnchorCandidate(observations: ParsedObservation[], quorum: number
     candidates.sort((a, b) => a.index - b.index);
     const median = candidates[Math.floor((candidates.length - 1) / 2)];
     const atMedian = observations.filter((o) => o.validatedIndex === median.index);
-    const hashAtMedian = modeWithQuorum(atMedian.map((o) => o.ledgerHash), quorum);
+    const hashAtMedian = modeWithQuorumDistinctUnl(atMedian, (o) => o.ledgerHash, quorum);
     if (hashAtMedian)
         return { index: median.index, hash: hashAtMedian };
 
@@ -185,27 +214,30 @@ function selectAnchorCandidate(observations: ParsedObservation[], quorum: number
 
 function mergeAgreedExtendResults(observations: ParsedObservation[], quorum: number): Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }> {
     const out: Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }> = {};
-    const byRef = new Map<string, SubmittedTxObservation[]>();
+    const byRef = new Map<string, Map<string, { unls: Set<string>; sample: SubmittedTxObservation }>>();
+
+    const nodesSeen = new Set<string>();
     for (const o of observations) {
+        const unl = o.unlPubkey.toLowerCase();
+        if (nodesSeen.has(unl))
+            continue;
+        nodesSeen.add(unl);
         for (const tx of o.submittedTx || []) {
             if (!byRef.has(tx.ref))
-                byRef.set(tx.ref, []);
-            byRef.get(tx.ref)!.push(tx);
+                byRef.set(tx.ref, new Map());
+            const refMap = byRef.get(tx.ref)!;
+            const key = `${tx.hash}|${tx.lastLedgerSequence}|${tx.resultCode}`;
+            if (!refMap.has(key))
+                refMap.set(key, { unls: new Set(), sample: tx });
+            refMap.get(key)!.unls.add(unl);
         }
     }
-    for (const [ref, txs] of byRef) {
-        const keyCounts = new Map<string, { count: number; sample: SubmittedTxObservation }>();
-        for (const tx of txs) {
-            const key = `${tx.hash}|${tx.lastLedgerSequence}|${tx.resultCode}`;
-            const cur = keyCounts.get(key);
-            if (!cur)
-                keyCounts.set(key, { count: 1, sample: tx });
-            else
-                cur.count++;
-        }
+
+    for (const [ref, keyMap] of byRef) {
         let best: SubmittedTxObservation | null = null;
         let bestCount = 0;
-        for (const { count, sample } of keyCounts.values()) {
+        for (const { unls, sample } of keyMap.values()) {
+            const count = unls.size;
             if (count >= quorum && count > bestCount) {
                 best = sample;
                 bestCount = count;
@@ -236,8 +268,8 @@ export function aggregateAnchorFromObservations(
         return null;
 
     const supporting = fromUnl.filter((o) => o.validatedIndex === pick.index && o.ledgerHash === pick.hash);
-    const tenantSequenceStr = modeWithQuorum(supporting.map((o) => String(o.tenantSequence)), quorum);
-    const signerListHash = modeWithQuorum(supporting.map((o) => o.signerListHash), quorum);
+    const tenantSequenceStr = modeWithQuorumDistinctUnl(supporting, (o) => String(o.tenantSequence), quorum);
+    const signerListHash = modeWithQuorumDistinctUnl(supporting, (o) => o.signerListHash, quorum);
     if (!tenantSequenceStr || !signerListHash)
         return null;
 
@@ -291,17 +323,16 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
         if (!acceptObservationDedup(operationData, unlPubkey, msg.observedLcl, msg.nonce))
             continue;
 
-        const submittedTx = Array.isArray(msg.submittedTx) ? msg.submittedTx : [];
-        const points = (msg.checkpoints && msg.checkpoints.length > 0)
-            ? msg.checkpoints
-            : [{
-                validatedIndex: msg.validatedIndex,
-                ledgerHash: msg.ledgerHash,
-                tenantSequence: msg.tenantSequence,
-                signerListHash: msg.signerListHash,
-            }];
+        const points = normalizeObservationCheckpoints(msg);
+        if (!points)
+            continue;
 
+        const submittedTx = Array.isArray(msg.submittedTx) ? msg.submittedTx : [];
+        const indexSeen = new Set<number>();
         for (const cp of points) {
+            if (indexSeen.has(cp.validatedIndex))
+                continue;
+            indexSeen.add(cp.validatedIndex);
             accepted.push({
                 unlPubkey,
                 userPubkey: userPublicKey,

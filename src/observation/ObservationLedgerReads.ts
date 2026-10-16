@@ -1,9 +1,6 @@
 import { createHash } from 'crypto';
 import { SignerListInfo } from '../models';
 
-export const DEFAULT_CHECKPOINT_INTERVAL = 10;
-export const DEFAULT_CHECKPOINT_WINDOW = 3;
-
 export function computeCheckpointIndexes(
     latestValidated: number,
     interval: number,

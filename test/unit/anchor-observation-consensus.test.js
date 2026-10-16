@@ -8,6 +8,7 @@ const {
     applyObservationInputs,
     quorumThreshold,
     NODE_USER_REGISTER_MESSAGE_TYPE,
+    ANCHOR_OBSERVATION_MESSAGE_TYPE,
 } = require('../../dist/cluster/AnchorObservation');
 const { buildAnchorObservationPayload: buildPayload } = require('../../dist/observation/ObservationSubmitter');
 
@@ -180,5 +181,88 @@ describe('anchor observation consensus', () => {
             }],
         });
         assert.strictEqual(operationData.nodeUserRegistrations[userKeys.publicKey], unlKeys.publicKey);
+    });
+
+    it('liar duplicate checkpoints cannot move anchor or complete extend', () => {
+        const unl = [0, 1, 2, 3, 4].map(unlKey);
+        const operationData = { operations: [], anchorLedger: 1_000_000, agreedTenantSequence: 42 };
+        const cp = {
+            validatedIndex: 2_000_000,
+            ledgerHash: 'FAKE',
+            tenantSequence: 99,
+            signerListHash: 'fake_signer',
+        };
+        const payload = {
+            type: ANCHOR_OBSERVATION_MESSAGE_TYPE,
+            observedLcl: 100,
+            observedLclHash: 'h',
+            nonce: 1,
+            validatedIndex: cp.validatedIndex,
+            ledgerHash: cp.ledgerHash,
+            tenantSequence: cp.tenantSequence,
+            signerListHash: cp.signerListHash,
+            submittedTx: [{
+                ref: 'extend_ref',
+                hash: 'fake_extend_hash',
+                lastLedgerSequence: 2_000_030,
+                resultCode: 'tesSUCCESS',
+            }],
+            checkpoints: [cp, cp, cp, cp],
+        };
+        applyObservationInputs({
+            operationData,
+            contractUnl: unl,
+            currentLcl: 100,
+            maxInputLedgerOffset: 32,
+            messages: [{ userPublicKey: unl[0], payload: Buffer.from(JSON.stringify(payload)) }],
+        });
+        assert.strictEqual(operationData.anchorLedger, 1_000_000);
+        assert.strictEqual(operationData.agreedExtendResults, undefined);
+    });
+
+    it('two colluding nodes of five cannot move anchor', () => {
+        const unl = [0, 1, 2, 3, 4].map(unlKey);
+        const operationData = { operations: [], anchorLedger: 1_000_000, agreedTenantSequence: 42 };
+        const messages = unl.slice(0, 2).map((pk) => ({
+            userPublicKey: pk,
+            payload: Buffer.from(JSON.stringify(buildPayload({
+                observedLcl: 100,
+                observedLclHash: 'h',
+                nonce: 1,
+                validatedIndex: 2_000_000,
+                ledgerHash: 'collude_fake',
+                tenantSequence: 99,
+                signerListHash: 'sig',
+                submittedTx: [],
+            }))),
+        }));
+        applyObservationInputs({
+            operationData,
+            contractUnl: unl,
+            currentLcl: 100,
+            maxInputLedgerOffset: 32,
+            messages,
+        });
+        assert.strictEqual(operationData.anchorLedger, 1_000_000);
+    });
+
+    it('conflicting hashes at one index drops the whole observation', () => {
+        const { normalizeObservationCheckpoints, ANCHOR_OBSERVATION_MESSAGE_TYPE } = require('../../dist/cluster/AnchorObservation');
+        const payload = {
+            type: ANCHOR_OBSERVATION_MESSAGE_TYPE,
+            observedLcl: 1,
+            observedLclHash: 'h',
+            nonce: 1,
+            validatedIndex: 1_000_000,
+            ledgerHash: 'a',
+            tenantSequence: 42,
+            signerListHash: 's',
+            submittedTx: [],
+            checkpoints: [
+                { validatedIndex: 1_000_010, ledgerHash: 'hash_a', tenantSequence: 42, signerListHash: 's' },
+                { validatedIndex: 1_000_010, ledgerHash: 'hash_b', tenantSequence: 42, signerListHash: 's' },
+            ],
+        };
+        assert.strictEqual(normalizeObservationCheckpoints(payload), null);
     });
 });
