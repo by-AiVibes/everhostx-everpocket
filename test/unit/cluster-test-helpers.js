@@ -129,6 +129,19 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}, le
             throw new Error(`No sequence stub for ${account}@${idx}`);
         },
         getTxAt: async (hash, idx) => ledgerHooks.getTxAt?.(hash, idx) ?? null,
+        getAccountSequenceAtForObservation: async (account, idx) => {
+            if (ledgerHooks.getAccountSequenceAtForObservation)
+                return ledgerHooks.getAccountSequenceAtForObservation(account, idx);
+            if (ledgerHooks.getAccountSequenceAt)
+                try {
+                    return await ledgerHooks.getAccountSequenceAt(account, idx);
+                } catch {
+                    return null;
+                }
+            if (idx === DEFAULT_ANCHOR && account === TENANT_ADDRESS)
+                return DEFAULT_TENANT_SEQUENCE;
+            return null;
+        },
         deinit: async () => {},
         multiSigner: { isSignerNode: () => false, getSigner: () => null },
         ...(xrplOverrides || {}),
