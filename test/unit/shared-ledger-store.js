@@ -22,23 +22,44 @@ function writeLedger(root, data) {
     fs.writeFileSync(ledgerPath(root), JSON.stringify(data));
 }
 
+const DEFAULT_SIGNER_LIST = { signerQuorum: 1, signerList: [{ account: 'rSimSigner', weight: 1 }] };
+
+function seedCheckpointLedgerFields(ledger, centerIndex, tenantAddress, tenantSequence, interval = 10, span = 50) {
+    if (!ledger.ledgerHashes)
+        ledger.ledgerHashes = {};
+    if (!ledger.signerLists)
+        ledger.signerLists = {};
+    const base = Math.floor(centerIndex / interval) * interval;
+    for (let i = -span; i <= span; i++) {
+        const idx = base + i * interval;
+        if (idx <= 0)
+            continue;
+        ledger.ledgerHashes[idx] = ledgerHashAt(idx);
+        ledger.signerLists[idx] = DEFAULT_SIGNER_LIST;
+        ledger.accountSequences[`${idx}:${tenantAddress}`] = tenantSequence;
+    }
+}
+
 function initLedger(root, { anchor, tenantSequence, tenantAddress }) {
-    writeLedger(root, {
+    const ledger = {
         globalValidatedIndex: anchor,
         nodeValidated: {},
         txs: {},
-        accountSequences: { [`${anchor}:${tenantAddress}`]: tenantSequence },
+        accountSequences: {},
         signerLists: {},
+        ledgerHashes: {},
         landedHashes: {},
         landedCountByRef: {},
         nodePendingSubmits: {},
-    });
+    };
+    seedCheckpointLedgerFields(ledger, anchor, tenantAddress, tenantSequence);
+    writeLedger(root, ledger);
 }
 
 function writePinnedRound(root, round, { anchor, tenantAddress, tenantSequence }) {
     const pinned = readLedger(root);
     if (anchor && tenantAddress && tenantSequence !== undefined)
-        pinned.accountSequences[`${anchor}:${tenantAddress}`] = tenantSequence;
+        seedCheckpointLedgerFields(pinned, anchor, tenantAddress, tenantSequence);
     fs.writeFileSync(pinnedPath(root, round), JSON.stringify(pinned));
 }
 
@@ -89,6 +110,10 @@ function ledgerBackendFromPinned(root, round, nodeId) {
             if (seq === undefined)
                 throw new Error(`No sequence at ${ledgerIndex} for ${account}`);
             return seq;
+        },
+        getLedgerHashAt: async (ledgerIndex) => {
+            const data = read();
+            return data.ledgerHashes?.[ledgerIndex] ?? null;
         },
         getPendingSubmitsForNode: () => {
             const data = read();

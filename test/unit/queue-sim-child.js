@@ -3,9 +3,9 @@ const path = require('path');
 
 const { buildClusterContext, writeAcquiresFile, TENANT_ADDRESS, DEFAULT_TENANT_SEQUENCE } = require('./cluster-test-helpers');
 const { unlPubkey, fakeUsersCollection } = require('./consensus-input-helpers');
-const { ledgerBackendFromPinned, readLedger, ledgerHashAt } = require('./shared-ledger-store');
+const { ledgerBackendFromPinned } = require('./shared-ledger-store');
 const { buildLastLedgerSequence } = require('../../dist/cluster/DeterministicTx');
-const { buildAnchorObservationPayload } = require('../../dist/observation/ObservationSubmitter');
+const { buildAnchorObservationFromReader } = require('../../dist/observation/ObservationPayloadBuilder');
 
 const workRoot = process.env.EVP_WORK_ROOT;
 const nodeDir = process.env.EVP_NODE_DIR;
@@ -15,6 +15,8 @@ const round = Number(process.env.EVP_ROUND);
 const lcl = Number(process.env.EVP_LCL);
 const phase = process.env.EVP_PHASE || 'exec';
 const EXTEND_PUBKEY = 'sim_extend_pubkey';
+const CHECKPOINT_INTERVAL = 10;
+const CHECKPOINT_WINDOW = 3;
 
 function shouldFailSubmit(s, nodeIndex, r) {
     const mix = (s * 31 + nodeIndex * 17 + r * 13) % 5;
@@ -25,21 +27,22 @@ function inboxPath() {
     return path.join(workRoot, 'inbox', `seed-${seed}-r${round}-${nodeId}.json`);
 }
 
-function buildLocalObservation(ledgerApi, anchor, tenantSequence) {
-    const validatedIndex = ledgerApi.getValidatedLedgerIndex();
+async function buildLocalObservation(ledgerApi) {
     const submittedTx = ledgerApi.getPendingSubmitsForNode();
+    const payload = await buildAnchorObservationFromReader(ledgerApi, {
+        observedLcl: lcl,
+        observedLclHash: process.env.EVP_LCL_HASH,
+        nonce: round + 1,
+        tenantAddress: TENANT_ADDRESS,
+        submittedTx,
+        checkpointInterval: CHECKPOINT_INTERVAL,
+        checkpointWindow: CHECKPOINT_WINDOW,
+    });
+    if (!payload)
+        throw new Error(`unable to build observation for ${nodeId} r${round}`);
     return {
         userPublicKey: unlPubkey(Number(nodeId.replace('n', ''))),
-        payload: JSON.stringify(buildAnchorObservationPayload({
-            observedLcl: lcl,
-            observedLclHash: process.env.EVP_LCL_HASH,
-            nonce: round + 1,
-            validatedIndex,
-            ledgerHash: ledgerHashAt(validatedIndex),
-            tenantSequence,
-            signerListHash: 'sim_signer_hash',
-            submittedTx,
-        })),
+        payload: JSON.stringify(payload),
     };
 }
 
@@ -51,12 +54,11 @@ async function main() {
     writeAcquiresFile();
     const ledgerApi = ledgerBackendFromPinned(workRoot, round, nodeId);
     const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-    const anchor = ops.anchorLedger ?? ops.agreedAnchor ?? 1_000_000;
-    const tenantSequence = ops.agreedTenantSequence ?? DEFAULT_TENANT_SEQUENCE;
+    const anchor = ops.anchorLedger ?? 1_000_000;
 
     if (phase === 'observe') {
         fs.mkdirSync(path.dirname(inboxPath()), { recursive: true });
-        fs.writeFileSync(inboxPath(), JSON.stringify(buildLocalObservation(ledgerApi, anchor, tenantSequence)));
+        fs.writeFileSync(inboxPath(), JSON.stringify(await buildLocalObservation(ledgerApi)));
         return;
     }
 
@@ -71,7 +73,7 @@ async function main() {
             const liveOps = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
             if (liveOps.agreedExtendResults?.[EXTEND_PUBKEY]?.resultCode === 'tesSUCCESS')
                 return { hash: liveOps.agreedExtendResults[EXTEND_PUBKEY].hash };
-            const seq = options?.txSubmitInfo?.sequence ?? tenantSequence;
+            const seq = options?.txSubmitInfo?.sequence ?? DEFAULT_TENANT_SEQUENCE;
             if (liveOps.consumedTenantSequences?.includes(seq))
                 return false;
             if (shouldFailSubmit(seed, Number(nodeId.replace('n', '')), round))
@@ -83,8 +85,6 @@ async function main() {
                 hash,
                 lastLedgerSequence: cap,
                 sequence: seq,
-                seed,
-                round,
             });
             return { hash, code: 'tesSUCCESS' };
         },
@@ -93,6 +93,9 @@ async function main() {
             getTxAt: (h, idx) => ledgerApi.getTxAt(h, idx),
             getSignerListAt: (idx) => ledgerApi.getSignerListAt(idx),
             getAccountSequenceAt: (acc, idx) => ledgerApi.getAccountSequenceAt(acc, idx),
+            getLedgerHashAt: (idx) => ledgerApi.getLedgerHashAt(idx),
+            getSignerListAtForObservation: (idx) => ledgerApi.getSignerListAt(idx),
+            getAccountSequenceAtForObservation: (acc, idx) => ledgerApi.getAccountSequenceAt(acc, idx).catch(() => null),
         },
     }, {
         lclSeqNo: lcl,
@@ -104,6 +107,8 @@ async function main() {
                 feeCeiling: '12000000',
                 anchorLedger: anchor,
                 tenantSequence: DEFAULT_TENANT_SEQUENCE,
+                checkpointInterval: CHECKPOINT_INTERVAL,
+                checkpointWindow: CHECKPOINT_WINDOW,
             },
             consensus: { roundtime: 1000, stage_slice: 100 },
             max_input_ledger_offset: 32,

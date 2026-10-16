@@ -673,6 +673,44 @@ class XrplContext {
         throw new Error(`Pinned Xahau read required for getAccountSequenceAt(${account}, ${ledgerIndex})`);
     }
 
+    public async getLedgerHashAt(ledgerIndex: number): Promise<string | null> {
+        if (ledgerIndex <= 0)
+            return null;
+        if (this.getValidatedLedgerIndex() < ledgerIndex)
+            return null;
+        if (this.xahauLedger?.getLedgerHashAt)
+            return await this.xahauLedger.getLedgerHashAt(ledgerIndex);
+        if (!this.xrplApi?.request)
+            return null;
+        try {
+            const res = await this.xrplApi.request({ command: 'ledger', ledger_index: ledgerIndex });
+            const ledger = res?.result?.ledger ?? res?.ledger;
+            return ledger?.ledger_hash ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    public async getSignerListAtForObservation(ledgerIndex: number): Promise<SignerListInfo | null> {
+        if (ledgerIndex <= 0 || this.getValidatedLedgerIndex() < ledgerIndex)
+            return null;
+        try {
+            return await this.getSignerListAt(ledgerIndex);
+        } catch {
+            return null;
+        }
+    }
+
+    public async getAccountSequenceAtForObservation(account: string, ledgerIndex: number): Promise<number | null> {
+        if (ledgerIndex <= 0 || this.getValidatedLedgerIndex() < ledgerIndex)
+            return null;
+        try {
+            return await this.getAccountSequenceAt(account, ledgerIndex);
+        } catch {
+            return null;
+        }
+    }
+
     /**
      * Check wether this node is a signer.
      * @returns true or false if signer or not.

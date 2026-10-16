@@ -123,6 +123,7 @@ describe('queue-sim multiprocess (phase 1)', () => {
                 tenantAddress: TENANT_ADDRESS,
             });
             const dirs = seedNodeDirs(seedRoot);
+            let maxAnchorSeen = DEFAULT_ANCHOR;
 
             for (let round = 0; round < ROUNDS_PER_SEED; round++) {
                 const ledger = readLedger(seedRoot);
@@ -161,7 +162,12 @@ describe('queue-sim multiprocess (phase 1)', () => {
                     assert.strictEqual(h, first);
 
                 mergeSubmitIntents(seedRoot, round);
+                const curAnchor = JSON.parse(fs.readFileSync(path.join(seedRoot, 'n0', 'operations.json'), 'utf8')).anchorLedger;
+                maxAnchorSeen = Math.max(maxAnchorSeen, curAnchor);
             }
+
+            assert.ok(maxAnchorSeen > DEFAULT_ANCHOR,
+                `seed ${seed}: anchor must advance under mixed local views (max ${maxAnchorSeen})`);
 
             const ledger = readLedger(seedRoot);
             assert.strictEqual(ledger.landedCountByRef[EXTEND_PUBKEY] ?? 0, 1,

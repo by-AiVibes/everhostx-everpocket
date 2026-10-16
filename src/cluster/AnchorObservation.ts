@@ -12,6 +12,13 @@ export interface SubmittedTxObservation {
     resultCode: string;
 }
 
+export interface ObservationCheckpointFields {
+    validatedIndex: number;
+    ledgerHash: string;
+    tenantSequence: number;
+    signerListHash: string;
+}
+
 export interface AnchorObservationPayload {
     type: typeof ANCHOR_OBSERVATION_MESSAGE_TYPE;
     observedLcl: number;
@@ -22,6 +29,8 @@ export interface AnchorObservationPayload {
     tenantSequence: number;
     signerListHash: string;
     submittedTx: SubmittedTxObservation[];
+    /** Recent deterministic checkpoint indices (multiples of checkpoint interval). */
+    checkpoints?: ObservationCheckpointFields[];
 }
 
 export interface NodeUserRegisterPayload {
@@ -282,17 +291,29 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
         if (!acceptObservationDedup(operationData, unlPubkey, msg.observedLcl, msg.nonce))
             continue;
 
-        accepted.push({
-            unlPubkey,
-            userPubkey: userPublicKey,
-            observedLcl: msg.observedLcl,
-            nonce: msg.nonce,
-            validatedIndex: msg.validatedIndex,
-            ledgerHash: msg.ledgerHash,
-            tenantSequence: msg.tenantSequence,
-            signerListHash: msg.signerListHash,
-            submittedTx: Array.isArray(msg.submittedTx) ? msg.submittedTx : [],
-        });
+        const submittedTx = Array.isArray(msg.submittedTx) ? msg.submittedTx : [];
+        const points = (msg.checkpoints && msg.checkpoints.length > 0)
+            ? msg.checkpoints
+            : [{
+                validatedIndex: msg.validatedIndex,
+                ledgerHash: msg.ledgerHash,
+                tenantSequence: msg.tenantSequence,
+                signerListHash: msg.signerListHash,
+            }];
+
+        for (const cp of points) {
+            accepted.push({
+                unlPubkey,
+                userPubkey: userPublicKey,
+                observedLcl: msg.observedLcl,
+                nonce: msg.nonce,
+                validatedIndex: cp.validatedIndex,
+                ledgerHash: cp.ledgerHash,
+                tenantSequence: cp.tenantSequence,
+                signerListHash: cp.signerListHash,
+                submittedTx,
+            });
+        }
     }
 
     const quorum = quorumThreshold(contractUnl.length);

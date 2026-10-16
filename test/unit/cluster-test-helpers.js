@@ -1,6 +1,7 @@
 const fs = require('fs');
 
 const { ClusterContext } = require('../../dist');
+const { scheduleObservationSubmit } = require('../../dist/observation/ObservationSidecar');
 
 const DEFAULT_ANCHOR = 1_000_000;
 const DEFAULT_TENANT_SEQUENCE = 42;
@@ -129,9 +130,11 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}, le
         ...(xrplOverrides || {}),
     };
 
+    const observationPendingSubmits = [];
     const evernodeContext = {
         hpContext,
         voteContext,
+        observationPendingSubmits,
         init: async () => {},
         bootstrapForRound: async () => { await defaultXrpl.bootstrapForRound(); },
         finishRoundInit: async () => {},
@@ -141,6 +144,13 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}, le
         getIfPending: () => null,
         acquireNode: async () => { throw new Error('acquire should not run in phase 1'); },
         extendSubmit: async () => false,
+        scheduleObservationSubmitOutOfBand: (peers, hooks) => scheduleObservationSubmit(
+            hpContext,
+            defaultXrpl,
+            peers,
+            observationPendingSubmits,
+            hooks,
+        ),
         xrplContext: defaultXrpl,
         ...restEvernodeOverrides,
     };

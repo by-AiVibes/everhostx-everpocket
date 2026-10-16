@@ -117,7 +117,7 @@ const testContract = async (contractCtx) => {
             const unlNodes = clusterContext.getClusterUnlNodes();
             if (unlNodes?.length) {
                 const peers = unlNodes.map(n => new evp.Peer(n.domain, n.userPort));
-                await evernodeContext.submitRoundObservationOutOfBand(peers);
+                evernodeContext.scheduleObservationSubmitOutOfBand(peers);
             }
         }
     }
