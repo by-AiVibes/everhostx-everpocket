@@ -8,6 +8,7 @@ import {
     RemoveNodeStep,
 } from '../models/cluster';
 import { SignerListInfo } from '../models';
+import { deriveMessagePublicKey } from './DeterministicTx';
 
 export const MAX_OPERATION_ATTEMPTS = 8;
 
@@ -15,8 +16,8 @@ export function operationAttempt(operation: Operation): number {
     return operation.attempt ?? operation.retryCount ?? 0;
 }
 
-export function operationNextAttemptLcl(operation: Operation): number {
-    return operation.nextAttemptLcl ?? operation.nextRetryLcl ?? 0;
+export function operationNextAttemptLcl(operation: Operation): number | undefined {
+    return operation.nextAttemptLcl ?? operation.nextRetryLcl;
 }
 
 export function backoffLcl(attempt: number): number {
@@ -28,23 +29,23 @@ export type QueueLedgerReader = {
     getSignerListAt(ledgerIndex: number): Promise<SignerListInfo | null>;
 };
 
-export type QueueAcquireReader = {
-    getLeasePending(hash: string): boolean;
-};
-
 export async function isAddComplete(
     op: Operation,
     snap: FrozenRoundSnapshot,
     ledger: QueueLedgerReader,
 ): Promise<boolean> {
     const data = op.data as AddNodeOperation;
-    if (snap.acquireData.acquiredNodes.some((n) => n.refId === data.acquireTxHash))
+    const hash = data.acquireTxHash;
+    if (hash && snap.acquireData.acquiredNodes.some((n) => n.refId === hash))
         return true;
-    if (snap.cluster.pendingNodes.some((p) => p.opRef === op.ref))
-        return true;
-    if (snap.cluster.nodes.some((n) => n.addOpRef === op.ref))
-        return true;
-    return false;
+    if (!hash || !data.acquireLedgerCap || snap.anchorLedger < data.acquireLedgerCap)
+        return false;
+    const tx = await ledger.getTxAt(hash, snap.anchorLedger);
+    if (!tx)
+        return false;
+    if (tx.resultCode === 'tesSUCCESS')
+        return false;
+    return tx.lastLedgerSequence <= snap.anchorLedger;
 }
 
 export async function isExtendComplete(
@@ -82,24 +83,21 @@ export async function isOperationComplete(
 
 export async function stepAdvanceAdd(op: Operation, snap: FrozenRoundSnapshot, ledger: QueueLedgerReader): Promise<void> {
     const data = op.data as AddNodeOperation;
-    if (!data.acquireTxHash) {
-        const pending = snap.acquireData.pendingAcquires.find((p) => p.opRef === op.ref);
-        if (pending) {
-            data.acquireTxHash = pending.refId;
-            data.acquireLedgerCap = pending.acquireLedgerCap;
-            if (pending.leaseOfferIdx)
-                data.leaseOfferIdx = pending.leaseOfferIdx;
-            if (pending.host)
-                data.host = pending.host;
-        }
-        return;
+    if (!data.messagePublicKey)
+        data.messagePublicKey = deriveMessagePublicKey(snap, op.ref);
+
+    const pending = snap.acquireData.pendingAcquires.find((p) => p.opRef === op.ref);
+    if (!data.acquireTxHash && pending?.refId) {
+        data.acquireTxHash = pending.refId;
+        data.acquireLedgerCap = pending.acquireLedgerCap;
     }
-    if (snap.anchorLedger < (data.acquireLedgerCap || 0))
-        return;
-    const tx = await ledger.getTxAt(data.acquireTxHash, snap.anchorLedger);
-    if (!tx || (tx.resultCode !== 'tesSUCCESS' && tx.lastLedgerSequence <= snap.anchorLedger)) {
-        delete data.acquireTxHash;
-        delete data.acquireLedgerCap;
+
+    if (data.acquireTxHash && data.acquireLedgerCap && snap.anchorLedger >= data.acquireLedgerCap) {
+        const tx = await ledger.getTxAt(data.acquireTxHash, snap.anchorLedger);
+        if (!tx || (tx.resultCode !== 'tesSUCCESS' && tx.lastLedgerSequence <= snap.anchorLedger)) {
+            delete data.acquireTxHash;
+            delete data.acquireLedgerCap;
+        }
     }
 }
 
@@ -121,7 +119,7 @@ export async function stepAdvanceRemove(
                 data.step = 'UNL';
                 continue;
             }
-            const list = cap > 0 ? await ledger.getSignerListAt(cap) : null;
+            const list = await ledger.getSignerListAt(cap);
             const onLedger = list?.signerList.some((s) => s.account === signerAddr) ?? false;
             if (!onLedger)
                 data.step = 'UNL';
@@ -154,15 +152,15 @@ export async function stepAdvanceOperation(
         await stepAdvanceRemove(op, snap, ledger);
 }
 
-export function shouldPerformAdd(
-    op: Operation,
-    snap: FrozenRoundSnapshot,
-    acquire: QueueAcquireReader,
-): boolean {
-    const data = op.data as AddNodeOperation;
-    if (data.acquireTxHash && acquire.getLeasePending(data.acquireTxHash))
+export function shouldPerformAdd(op: Operation, snap: FrozenRoundSnapshot): boolean {
+    const snapOp = snap.operations.find((o) => o.ref === op.ref && o.type === OperationType.ADD_NODE);
+    const snapData = snapOp?.data as AddNodeOperation | undefined;
+    if (!snapData?.messagePublicKey)
         return false;
-    if (snap.acquireData.pendingAcquires.some((p) => p.opRef === op.ref && p.refId))
+    const data = op.data as AddNodeOperation;
+    if (data.acquireTxHash)
+        return false;
+    if (snap.acquireData.pendingAcquires.some((p) => p.opRef === op.ref))
         return false;
     return true;
 }

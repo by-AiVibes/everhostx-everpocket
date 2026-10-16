@@ -61,7 +61,7 @@ describe('Fix 5: pending aliveness defers ADD only', () => {
                 };
             },
             getIfPending: (refId) => refId === PENDING_REF,
-            acquireNode: async () => {
+            acquireNodeFromSnapshot: async () => {
                 throw new Error('ADD must be deferred during aliveness check');
             },
         }, { lclSeqNo: 200 }, 15);

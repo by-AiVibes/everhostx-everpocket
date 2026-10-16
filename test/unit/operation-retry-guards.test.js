@@ -42,7 +42,7 @@ describe('Operation retry guards (regression)', () => {
                 type: 'remove_node',
                 ref: BLOCKED_PUBKEY,
                 data: { nodePubkey: BLOCKED_PUBKEY, force: false },
-                attempt: MAX_OPERATION_ATTEMPTS - 1,
+                attempt: MAX_OPERATION_ATTEMPTS,
             }],
         });
 

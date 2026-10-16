@@ -2,16 +2,17 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const { FakeXahauLedger } = require('../../dist/ledger/FakeXahauLedger');
+const { FakeXahauLedger } = require('../helpers/FakeXahauLedger');
 const {
     writeAcquiresFile,
     writeClusterFiles,
     buildClusterContext,
-    createAcquireTxHarness,
     readAcquiresFile,
 } = require('./cluster-test-helpers');
 
 const NODE_COUNT = 5;
+const SHARED_LCL_HASH = 'cafebabe00cafebabe00cafebabe00cafebabe';
+let activeSimRound = 0;
 
 function mulberry32(seed) {
     return function next() {
@@ -29,13 +30,101 @@ function stateSha256(dir) {
     return crypto.createHash('sha256').update(ops).update(cluster).update(acquires).digest('hex');
 }
 
+function messagePublicKeyForAdd(ref, lclSeqNo, anchorLedger) {
+    const { deriveMessagePublicKey } = require('../../dist/cluster/DeterministicTx');
+    return deriveMessagePublicKey({ anchorLedger, tenantSequence: 1, lclSeqNo }, ref);
+}
+
+function defaultHpOverrides(lclSeqNo) {
+    return {
+        lclSeqNo,
+        lclHash: SHARED_LCL_HASH,
+        getContractConfig: async () => ({
+            unl: ['pk0', 'pk1', 'pk2', 'pk3', 'pk4'],
+            evernode: { hosts: ['host.alpha', 'host.beta'], feeCeiling: '12000000' },
+            consensus: { roundtime: 1000, stage_slice: 100 },
+        }),
+        getContractUnl: () => [{ publicKey: 'pk0' }],
+        updateContractConfig: async (cfg) => cfg,
+        updatePeers: async () => {},
+        checkLiveness: async () => false,
+    };
+}
+
 function xahauStub(ledger, nodeId) {
     return {
+        bootstrapForRound: async () => {},
+        reconcileValidatedTransactions: async () => {},
+        deriveTxSubmitInfo: (snap) => ({
+            sequence: snap?.tenantSequence ?? 1,
+            maxLedgerSequence: (snap?.anchorLedger ?? ledger.getValidatedLedgerIndex()) + 30,
+            fee: '12000000',
+        }),
         getValidatedLedgerIndex: () => ledger.getNodeValidatedIndex(nodeId),
         getTxAt: (hash, idx) => ledger.getTxAt(hash, idx),
         getSignerListAt: (idx) => ledger.getSignerListAt(idx),
         getSignerList: () => null,
+        deinit: async () => {},
         multiSigner: { isSignerNode: () => false, getSigner: () => null },
+    };
+}
+
+function createSimEvernode(nodeIndex, ledger, options = {}) {
+    const deferred = [];
+    const {
+        acquireTxCanonicalFields,
+        computeAcquireTxHash,
+        deriveHost,
+        deriveLastLedgerSequence,
+    } = require('../../dist/cluster/DeterministicTx');
+
+    return {
+        applyDeferredAcquireWrites: () => {
+            const data = readAcquiresFile();
+            for (const p of deferred) {
+                if (!data.pendingAcquires.some((x) => x.refId === p.refId))
+                    data.pendingAcquires.push(p);
+            }
+            deferred.length = 0;
+            writeAcquiresFile(data);
+        },
+        acquireNodeFromSnapshot: async (snap, opRef) => {
+            const snapOp = snap.operations.find((o) => o.ref === opRef);
+            const messagePublicKey = snapOp?.data?.messagePublicKey;
+            if (!messagePublicKey)
+                throw new Error('messagePublicKey missing from snapshot');
+            const canonical = acquireTxCanonicalFields(snap, opRef, messagePublicKey);
+            const refId = computeAcquireTxHash(canonical, '1');
+            const acquireLedgerCap = deriveLastLedgerSequence(snap);
+            ledger.recordAcquireSubmit(canonical, refId);
+            const resultCode = options.txResultCode || 'tesSUCCESS';
+            if (!options.skipLedgerRecord) {
+                ledger.putTxAt(snap.anchorLedger, {
+                    hash: refId,
+                    resultCode,
+                    lastLedgerSequence: acquireLedgerCap,
+                });
+            }
+            const pending = {
+                refId,
+                host: deriveHost(snap, opRef),
+                leaseOfferIdx: '1',
+                messageKey: messagePublicKey,
+                acquireSentOnLcl: snap.lclSeqNo,
+                opRef,
+                acquireLedgerCap,
+            };
+            deferred.push(pending);
+            if (options.throwAllUntilRound !== undefined && activeSimRound < options.throwAllUntilRound)
+                throw new Error('sim acquire throw');
+            if (options.throwOnNodes?.includes(nodeIndex) && activeSimRound < (options.throwUntilRound ?? 0))
+                throw new Error('sim acquire throw');
+            return pending;
+        },
+        getAcquireDataSnapshot: () => readAcquiresFile(),
+        getIfPending: (refId) => readAcquiresFile().pendingAcquires.find((p) => p.refId === refId) || null,
+        getIfAcquired: (refId) => readAcquiresFile().acquiredNodes.find((n) => n.refId === refId) || null,
+        extendSubmit: async () => false,
     };
 }
 
@@ -51,19 +140,36 @@ function initNodeDirs(workRoot, seed, opsFactory) {
     return dirs;
 }
 
+const nodeContexts = new Map();
+
+function getOrCreateNodeContext(dir, nodeIndex, ledger, lcl, hooks) {
+    const nodeId = `n${nodeIndex}`;
+    if (!nodeContexts.has(dir)) {
+        const sim = createSimEvernode(nodeIndex, ledger, hooks.simOptions || {});
+        nodeContexts.set(dir, buildClusterContext({
+            ...sim,
+            ...hooks.evernodeForNode?.(nodeIndex),
+            xrplContext: xahauStub(ledger, nodeId),
+        }, { ...defaultHpOverrides(lcl), ...hooks.hpForNode?.(nodeIndex) }));
+    }
+    const ctx = nodeContexts.get(dir);
+    ctx.hpContext.lclSeqNo = lcl;
+    return ctx;
+}
+
+function resetNodeContexts() {
+    nodeContexts.clear();
+}
+
 async function runAllNodesOneRound({ dirs, ledger, lcl, hooks = {} }) {
+    activeSimRound = hooks.round ?? 0;
     const hashes = [];
     const aborted = [];
     for (let i = 0; i < dirs.length; i++) {
         const nodeId = `n${i}`;
         ledger.setNodeValidatedIndex(nodeId, ledger.getValidatedLedgerIndex());
         process.chdir(dirs[i]);
-        const harness = hooks.harnessFactory ? hooks.harnessFactory(i) : createAcquireTxHarness();
-        const ctx = buildClusterContext({
-            ...harness.evernodeOverrides,
-            ...hooks.evernodeForNode?.(i, harness),
-            xrplContext: xahauStub(ledger, nodeId),
-        }, { lclSeqNo: lcl, ...hooks.hpForNode?.(i) });
+        const ctx = getOrCreateNodeContext(dirs[i], i, ledger, lcl, hooks);
         await ctx.init();
         const wasAborted = ctx.isRoundAborted?.() ?? false;
         await ctx.deinit();
@@ -72,16 +178,6 @@ async function runAllNodesOneRound({ dirs, ledger, lcl, hooks = {} }) {
             hashes.push(stateSha256(dirs[i]));
     }
     return { hashes, aborted };
-}
-
-function syncDirsFromLeader(dirs, leaderIndex = 0) {
-    for (let i = 0; i < dirs.length; i++) {
-        if (i === leaderIndex)
-            continue;
-        for (const f of ['operations.json', 'cluster.json', 'acquires.json']) {
-            fs.copyFileSync(path.join(dirs[leaderIndex], f), path.join(dirs[i], f));
-        }
-    }
 }
 
 function assertHashConsensus(hashes) {
@@ -94,12 +190,15 @@ function assertHashConsensus(hashes) {
 
 module.exports = {
     NODE_COUNT,
+    SHARED_LCL_HASH,
     mulberry32,
     stateSha256,
+    messagePublicKeyForAdd,
     xahauStub,
+    createSimEvernode,
     initNodeDirs,
     runAllNodesOneRound,
     assertHashConsensus,
-    syncDirsFromLeader,
     FakeXahauLedger,
+    resetNodeContexts,
 };

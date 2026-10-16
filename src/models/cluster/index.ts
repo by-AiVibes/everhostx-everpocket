@@ -64,6 +64,8 @@ export interface AddNodeOperation {
   acquireLedgerCap?: number;
   leaseOfferIdx?: string;
   host?: string;
+  /** Agreed message public key (prior round); not derived from lclHash. */
+  messagePublicKey?: string;
 }
 
 export interface ExtendNodeOperation {
@@ -99,6 +101,7 @@ export interface Operation {
 export interface OperationData {
   operations: Operation[];
   anchorLedger?: number;
+  tenantSequence?: number;
 }
 
 export enum ClusterMessageType {

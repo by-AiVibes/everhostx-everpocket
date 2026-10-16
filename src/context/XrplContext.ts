@@ -11,6 +11,8 @@ import { error, log } from '../helpers/logger';
 import NumberHelpers from '../utils/helpers/NumberHelper';
 import { XahauLedgerBackend } from '../ledger/XahauLedgerBackend';
 import { EVERNODE_XAHAU_NETWORK_KEY } from '../ledger/xahauConstants';
+import { FrozenRoundSnapshot } from '../cluster/RoundSnapshot';
+import { deriveFee, deriveLastLedgerSequence, deriveSequence } from '../cluster/DeterministicTx';
 
 const TIMEOUT = 10000;
 const TRANSACTION_VOTE_THRESHOLD = 0.5;
@@ -53,6 +55,18 @@ class XrplContext {
         if (this.initialized)
             return;
 
+        await this.bootstrapForRound();
+        await this.reconcileValidatedTransactions(0);
+        this.initialized = true;
+    }
+
+    /**
+     * Connect and load signer list only (no validation side effects).
+     */
+    public async bootstrapForRound(): Promise<void> {
+        if (this.xrplApi?.isConnected?.())
+            return;
+
         await evernode.Defaults.useNetwork(this.contextOptions.network || EVERNODE_XAHAU_NETWORK_KEY);
         this.xrplApi = this.xrplApi || new evernode.XrplApi(this.contextOptions.rippleServer, { autoReconnect: false, ...this.contextOptions });
         evernode.Defaults.set({
@@ -63,17 +77,32 @@ class XrplContext {
 
         await this.xrplApi.connect();
         await this.loadSignerList();
+    }
+
+    /**
+     * Reconcile pending txs and local signer state (§4.1 — not in bare init).
+     */
+    public async reconcileValidatedTransactions(_anchorLedger: number): Promise<void> {
         this.#checkSignerValidity();
         await this.#checkForValidateTransactions();
-        this.initialized = true;
+    }
+
+    public deriveTxSubmitInfo(snap: FrozenRoundSnapshot): TransactionSubmissionInfo {
+        return {
+            sequence: deriveSequence(snap),
+            maxLedgerSequence: deriveLastLedgerSequence(snap),
+            fee: deriveFee(snap),
+        };
     }
 
     /**
      * Deinitialize the xrpl context.
      */
-    public async deinit(): Promise<void> {
-        this.#persistTransactionData();
-        await this.xrplApi.disconnect();
+    public async deinit(roundAborted: boolean = false): Promise<void> {
+        if (!roundAborted)
+            this.#persistTransactionData();
+        if (this.xrplApi?.isConnected())
+            await this.xrplApi.disconnect();
     }
 
     /**
@@ -310,7 +339,10 @@ class XrplContext {
         if (!this.signerListInfo || !signerCount)
             throw `${transaction.TransactionType} | Could not get signer list`;
 
-        transaction.Fee = `${Number(transaction.Fee) * (signerCount + 2)}`;
+        if (txSubmitInfo.fee)
+            transaction.Fee = txSubmitInfo.fee;
+        else
+            transaction.Fee = `${Number(transaction.Fee) * (signerCount + 2)}`;
 
         const elector = new AllVoteElector(signerCount, options?.voteElectorOptions?.timeout || TIMEOUT);
         const electionName = `sign${this.voteContext.getUniqueNumber()}`;
@@ -633,12 +665,7 @@ class XrplContext {
             throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
         if (this.xahauLedger)
             return await this.xahauLedger.getTxAt(hash, ledgerIndex);
-        const tx = this.getValidatedTransaction(hash);
-        if (!tx)
-            return null;
-        if (tx.ledgerIndex !== undefined && tx.ledgerIndex > ledgerIndex)
-            return null;
-        return tx;
+        throw new Error(`Pinned Xahau read required for getTxAt(${hash}, ${ledgerIndex})`);
     }
 
     public async getSignerListAt(ledgerIndex: number): Promise<SignerListInfo | null> {
@@ -646,7 +673,7 @@ class XrplContext {
             throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
         if (this.xahauLedger)
             return await this.xahauLedger.getSignerListAt(ledgerIndex);
-        return this.signerListInfo;
+        throw new Error(`Pinned Xahau read required for getSignerListAt(${ledgerIndex})`);
     }
 
     /**

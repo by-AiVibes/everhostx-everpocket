@@ -72,24 +72,43 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
         vote: async (_electionName, cast) => [{ sender: 'self', data: cast[0] }],
     };
 
+    const defaultXrpl = {
+        bootstrapForRound: async () => {},
+        reconcileValidatedTransactions: async () => {},
+        deriveTxSubmitInfo: (snap) => ({
+            sequence: snap?.tenantSequence ?? 1,
+            maxLedgerSequence: (snap?.anchorLedger ?? 1_000_000) + 30,
+            fee: '12000000',
+        }),
+        getValidatedLedgerIndex: () => 1_000_000,
+        getSignerList: () => null,
+        getSignerListAt: async () => ({ signerQuorum: 1, signerList: [] }),
+        getTxAt: async () => null,
+        deinit: async () => {},
+        multiSigner: { isSignerNode: () => false, getSigner: () => null },
+        ...(xrplOverrides || {}),
+    };
+
     const evernodeContext = {
         hpContext,
         voteContext,
         init: async () => {},
+        bootstrapForRound: async () => { await defaultXrpl.bootstrapForRound(); },
+        finishRoundInit: async () => {},
+        applyDeferredAcquireWrites: () => {},
         deinit: async () => {},
         getAcquireDataSnapshot: () => readAcquiresFile(),
         getIfAcquired: () => null,
-        getIfPending: () => false,
+        getIfPending: () => null,
         acquireNode: async () => { throw new Error('acquire should not run'); },
+        acquireNodeFromSnapshot: async () => { throw new Error('acquireNodeFromSnapshot should be stubbed'); },
         extendSubmit: async () => false,
-        xrplContext: {
-            getValidatedLedgerIndex: () => 1_000_000,
-            getSignerList: () => null,
-            multiSigner: { isSignerNode: () => false, getSigner: () => null },
-            ...(xrplOverrides || {}),
-        },
+        xrplContext: defaultXrpl,
         ...restEvernodeOverrides,
     };
+
+    if (restEvernodeOverrides.xrplContext)
+        evernodeContext.xrplContext = { ...defaultXrpl, ...restEvernodeOverrides.xrplContext };
 
     evernodeContext.hpContext = hpContext;
     return new ClusterContext(evernodeContext);
@@ -119,6 +138,7 @@ async function runClusterUntilSettled(evernodeOverrides, hpOverrides = {}, maxRo
 function createAcquireTxHarness() {
     const pendingTxHashes = new Set();
     const acquiredByTx = new Map();
+    const deferredPending = [];
     let txSeq = 0;
 
     function syncAcquiresFile() {
@@ -137,18 +157,44 @@ function createAcquireTxHarness() {
         writeAcquiresFile({ pendingAcquires, acquiredNodes });
     }
 
+    function applyDeferredAcquireWrites() {
+        const data = readAcquiresFile();
+        for (const p of deferredPending) {
+            pendingTxHashes.add(p.refId);
+            if (!data.pendingAcquires.some((x) => x.refId === p.refId))
+                data.pendingAcquires.push(p);
+        }
+        deferredPending.length = 0;
+        writeAcquiresFile(data);
+    }
+
     const evernodeOverrides = {
-        acquireNode: async () => {
+        applyDeferredAcquireWrites,
+        acquireNodeFromSnapshot: async (_snap, opRef) => {
             const refId = `0xacquire_tx_${++txSeq}`;
-            pendingTxHashes.add(refId);
-            syncAcquiresFile();
-            return { refId, host: 'host.example' };
+            const pending = {
+                refId,
+                host: 'host.example',
+                leaseOfferIdx: 'idx',
+                messageKey: 'mk',
+                acquireSentOnLcl: 0,
+                opRef,
+                acquireLedgerCap: 999_000,
+            };
+            deferredPending.push(pending);
+            return pending;
+        },
+        acquireNode: async () => {
+            throw new Error('legacy acquireNode should not run');
         },
         getIfPending: (refId) => {
             const pending = readAcquiresFile().pendingAcquires.find((n) => n.refId === refId);
             return pending || null;
         },
-        getIfAcquired: (refId) => acquiredByTx.get(refId) ?? null,
+        getIfAcquired: (refId) => {
+            const fromFile = readAcquiresFile().acquiredNodes.find((n) => n.refId === refId);
+            return fromFile ?? acquiredByTx.get(refId) ?? null;
+        },
         getAcquireDataSnapshot: () => readAcquiresFile(),
     };
 
@@ -156,6 +202,7 @@ function createAcquireTxHarness() {
         evernodeOverrides,
         pendingTxHashes,
         acquiredByTx,
+        applyDeferredAcquireWrites,
         markAcquired(refId, info) {
             pendingTxHashes.delete(refId);
             acquiredByTx.set(refId, info);

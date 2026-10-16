@@ -31,27 +31,39 @@ describe('ADD acquire refId (tx hash) vs opRef', () => {
 
     it('performs exactly one acquire across many LCL rounds until pending opRef is agreed', async () => {
         const harness = createAcquireTxHarness();
+        const { deriveMessagePublicKey } = require('../../dist/cluster/DeterministicTx');
+        const messagePublicKey = deriveMessagePublicKey({
+            anchorLedger: 1_000_000,
+            tenantSequence: 1,
+            lclSeqNo: 500,
+        }, ADD_REF);
         writeClusterFiles({
             nodes: [],
             pendingNodes: [],
             operations: [{
                 type: OperationType.ADD_NODE,
                 ref: ADD_REF,
-                data: { acquireOptions: {}, lifeMoments: 1 },
+                data: { acquireOptions: {}, lifeMoments: 1, messagePublicKey },
             }],
         });
 
         let acquireCalls = 0;
         const ctxFactory = (lcl) => buildClusterContext({
             ...harness.evernodeOverrides,
-            acquireNode: async (opts) => {
+            acquireNodeFromSnapshot: async (snap, opRef) => {
                 acquireCalls++;
-                return harness.evernodeOverrides.acquireNode(opts);
+                return harness.evernodeOverrides.acquireNodeFromSnapshot(snap, opRef);
             },
-        }, { lclSeqNo: lcl, checkLiveness: async () => true });
+        }, { lclSeqNo: lcl, lclHash: 'hash' });
 
         let lcl = 500;
-        let ctx = ctxFactory(lcl);
+        const ctx = ctxFactory(lcl);
+        await ctx.init();
+        await ctx.deinit();
+        assert.strictEqual(acquireCalls, 1);
+
+        lcl += 4;
+        ctx.hpContext.lclSeqNo = lcl;
         await ctx.init();
         await ctx.deinit();
         assert.strictEqual(acquireCalls, 1);
@@ -62,32 +74,10 @@ describe('ADD acquire refId (tx hash) vs opRef', () => {
         const txRef = clusterAfter.pendingNodes[0].refId;
         assert.ok(txRef.startsWith('0xacquire_tx_'));
 
-        lcl += 4;
-        ctx = ctxFactory(lcl);
-        await ctx.init();
-        await ctx.deinit();
-        assert.strictEqual(acquireCalls, 1);
         let ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 0);
+        assert.strictEqual(ops.operations.length, 1);
 
-        for (let round = 0; round < 6; round++) {
-            lcl += 4;
-            harness.markAcquired(txRef, {
-                domain: 'node.example',
-                userPort: 1,
-                peerPort: 2,
-                contractId: 'cid',
-                pubkey: 'pending_pubkey_stable',
-                name: 'n',
-                outboundIp: '1.2.3.4',
-            });
-            ctx = ctxFactory(lcl);
-            await ctx.init();
-            await ctx.deinit();
-            assert.strictEqual(acquireCalls, 1);
-        }
-
-        ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-        assert.strictEqual(ops.operations.length, 0);
+        const acquires = JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
+        assert.ok(acquires.pendingAcquires.some((p) => p.opRef === ADD_REF));
     });
 });

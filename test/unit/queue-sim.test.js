@@ -1,31 +1,65 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert');
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
 const { OperationType } = require('../../dist/models/cluster');
-const { FakeXahauLedger } = require('../../dist/ledger/FakeXahauLedger');
 const { createWorkDir } = require('./test-workdir');
-const {
-    writeAcquiresFile,
-    writeClusterFiles,
-    buildClusterContext,
-    createAcquireTxHarness,
-    readAcquiresFile,
-} = require('./cluster-test-helpers');
+const { writeAcquiresFile, writeClusterFiles } = require('./cluster-test-helpers');
 const {
     NODE_COUNT,
-    mulberry32,
-    stateSha256,
-    xahauStub,
+    messagePublicKeyForAdd,
     initNodeDirs,
     runAllNodesOneRound,
     assertHashConsensus,
-    syncDirsFromLeader,
+    resetNodeContexts,
+    FakeXahauLedger,
 } = require('./queue-sim-harness');
 
 const ADD_REF = 'queue_sim_add_ref';
+
+function addOp(ref, lcl, anchor) {
+    return {
+        type: OperationType.ADD_NODE,
+        ref,
+        data: {
+            acquireOptions: {},
+            lifeMoments: 1,
+            messagePublicKey: messagePublicKeyForAdd(ref, lcl, anchor),
+        },
+    };
+}
+
+function markAcquiredAll(dirs, refId, addRef = ADD_REF) {
+    for (const dir of dirs) {
+        const file = path.join(dir, 'acquires.json');
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (!data.acquiredNodes.some((n) => n.refId === refId)) {
+            data.acquiredNodes.push({
+                refId,
+                host: 'host.alpha',
+                name: 'inst',
+                domain: 'node.example',
+                pubkey: 'acquired_pk',
+                userPort: 1,
+                peerPort: 2,
+                contractId: 'cid',
+                outboundIp: '1.2.3.4',
+            });
+        }
+        data.pendingAcquires = data.pendingAcquires.filter((p) => p.refId !== refId);
+        fs.writeFileSync(file, JSON.stringify(data));
+        const opsPath = path.join(dir, 'operations.json');
+        const ops = JSON.parse(fs.readFileSync(opsPath, 'utf8'));
+        for (const op of ops.operations) {
+            if (op.ref === addRef && op.type === OperationType.ADD_NODE) {
+                op.data.acquireTxHash = refId;
+                op.data.acquireLedgerCap = 10_030;
+            }
+        }
+        fs.writeFileSync(opsPath, JSON.stringify(ops));
+    }
+}
 
 describe('queue-sim (shared FakeXahau ledger)', () => {
     let workRoot;
@@ -37,118 +71,192 @@ describe('queue-sim (shared FakeXahau ledger)', () => {
         workRoot = createWorkDir('evp-queue-sim');
         ledger = new FakeXahauLedger();
         ledger.setGlobalValidatedIndex(10_000);
+        resetNodeContexts();
     });
 
     afterEach(() => {
+        resetNodeContexts();
         process.chdir(originalCwd);
         fs.rmSync(workRoot, { recursive: true, force: true });
     });
 
     it('matrix 1: partial acquireSubmit throws on 2 nodes, equal hashes, ADD completes', async () => {
+        const anchor = 10_000;
         const dirs = initNodeDirs(workRoot, 1, () => ({
             nodes: [],
             pendingNodes: [],
-            operations: [{ type: OperationType.ADD_NODE, ref: ADD_REF, data: { acquireOptions: {}, lifeMoments: 1 } }],
+            operations: [addOp(ADD_REF, 100, anchor)],
         }));
-        let ledgerTxCount = 0;
-        for (let round = 0; round < 8; round++) {
-            ledger.setGlobalValidatedIndex(10_000 + round);
-            const sharedRef = `0xacquire_m1_r${round}`;
+        for (let round = 0; round < 12; round++) {
+            ledger.setGlobalValidatedIndex(anchor + round);
             const { hashes } = await runAllNodesOneRound({
                 dirs,
                 ledger,
                 lcl: 100 + round * 4,
                 hooks: {
+                    round,
+                    simOptions: { throwAllUntilRound: 3 },
+                },
+            });
+            assertHashConsensus(hashes);
+        }
+        assert.strictEqual(ledger.uniqueAcquireHashes().size, 1);
+        const refId = [...ledger.uniqueAcquireHashes()][0];
+        markAcquiredAll(dirs, refId);
+        ledger.setGlobalValidatedIndex(anchor + 40);
+        const { hashes: finalHashes } = await runAllNodesOneRound({
+            dirs,
+            ledger,
+            lcl: 200,
+            hooks: { round: 99 },
+        });
+        assertHashConsensus(finalHashes);
+        for (const dir of dirs) {
+            const ops = JSON.parse(fs.readFileSync(path.join(dir, 'operations.json'), 'utf8'));
+            assert.strictEqual(ops.operations.length, 0);
+        }
+    });
+
+    it('matrix 2: partial delivery — votes drop for 2/5 nodes, no vote fields persisted', async () => {
+        const anchor = 10_000;
+        const dirs = initNodeDirs(workRoot, 2, () => ({
+            nodes: [],
+            pendingNodes: [],
+            operations: [addOp(ADD_REF, 100, anchor)],
+        }));
+        for (let round = 0; round < 6; round++) {
+            ledger.setGlobalValidatedIndex(anchor + round);
+            const { hashes } = await runAllNodesOneRound({
+                dirs,
+                ledger,
+                lcl: 100 + round * 4,
+                hooks: {
+                    round,
                     evernodeForNode: (i) => ({
-                        acquireNode: async (_opts, opRef) => {
-                            if ((i === 1 || i === 3) && round < 3)
-                                throw new Error('sim acquire throw');
-                            ledgerTxCount++;
-                            const pending = {
-                                refId: sharedRef,
-                                host: 'h',
-                                opRef,
-                                acquireLedgerCap: 10_000 + round + 5,
-                            };
-                            writeAcquiresFile({
-                                pendingAcquires: [{
-                                    ...pending,
-                                    leaseOfferIdx: '1',
-                                    messageKey: 'mk',
-                                    acquireSentOnLcl: 100,
-                                }],
-                                acquiredNodes: [],
-                            });
-                            ledger.putTxAt(10_000 + round, {
-                                hash: sharedRef,
-                                resultCode: 'tesSUCCESS',
-                                lastLedgerSequence: 10_000 + round + 5,
-                            });
-                            return pending;
+                        voteContext: {
+                            getUniqueNumber: () => 1,
+                            vote: async (_name, cast) => (i === 1 || i === 3 ? [] : [{ sender: 'self', data: cast[0] }]),
                         },
-                        getAcquireDataSnapshot: () => readAcquiresFile(),
-                        getIfPending: (refId) => readAcquiresFile().pendingAcquires.find((p) => p.refId === refId) || null,
                     }),
                 },
             });
-            syncDirsFromLeader(dirs, 0);
-            const roundHashes = dirs.map((d) => stateSha256(d));
-            if (roundHashes.length)
-                assertHashConsensus(roundHashes);
+            assertHashConsensus(hashes);
+            for (const dir of dirs) {
+                const raw = fs.readFileSync(path.join(dir, 'operations.json'), 'utf8');
+                assert.ok(!raw.includes('transactionMaxLls'));
+                assert.ok(!raw.includes('message_key_selection'));
+            }
         }
-        assert.ok(ledgerTxCount >= 1);
     });
 
-    it('matrix 3: ADD succeeded on ledger but acquireSubmit threw — exactly 1 acquire', async () => {
-        const dir = path.join(workRoot, 'n0');
+    it('matrix 3: multi-node ADD — ledger has tx, one node throws after submit — exactly 1 acquire', async () => {
+        const anchor = 10_000;
+        const seedRoot = path.join(workRoot, 'm3');
+        fs.mkdirSync(seedRoot, { recursive: true });
+        const dirs = initNodeDirs(seedRoot, 3, () => ({
+            nodes: [],
+            pendingNodes: [],
+            operations: [addOp(ADD_REF, 100, anchor)],
+        }));
+        resetNodeContexts();
+        for (let round = 0; round < 8; round++) {
+            ledger.setGlobalValidatedIndex(anchor + round);
+            await runAllNodesOneRound({
+                dirs,
+                ledger,
+                lcl: 100 + round * 4,
+                hooks: {
+                    round,
+                    simOptions: { throwOnNodes: [0], throwUntilRound: 1 },
+                },
+            });
+        }
+        assert.strictEqual(ledger.uniqueAcquireHashes().size, 1);
+        assert.ok(ledger.acquireSubmitCount() >= 1);
+    });
+
+    it('matrix 4: ADD tx failed (tecX) then one re-acquire after cap', async () => {
+        const anchor = 10_000;
+        const dirs = initNodeDirs(workRoot, 4, () => ({
+            nodes: [],
+            pendingNodes: [],
+            operations: [addOp(ADD_REF, 100, anchor)],
+        }));
+        resetNodeContexts();
+        await runAllNodesOneRound({
+            dirs,
+            ledger,
+            lcl: 100,
+            hooks: { round: 0, simOptions: { txResultCode: 'tecINSUFFICIENT_RESERVE' } },
+        });
+        const firstCount = ledger.acquireSubmitCount();
+        assert.ok(firstCount >= 1);
+        ledger.setGlobalValidatedIndex(anchor + 35);
+        resetNodeContexts();
+        await runAllNodesOneRound({
+            dirs,
+            ledger,
+            lcl: 104,
+            hooks: { round: 1, simOptions: { txResultCode: 'tesSUCCESS' } },
+        });
+        assert.ok(ledger.acquireSubmitCount() > firstCount);
+        assert.strictEqual(ledger.uniqueAcquireHashes().size, 2);
+    });
+
+    it('matrix 5: REMOVE crash after SIGNER — no second replaceSignerList on resume', async () => {
+        const anchor = 10_000;
+        const removePk = 'remove_crash_pubkey';
+        const dir = path.join(workRoot, 'm5');
         fs.mkdirSync(dir, { recursive: true });
         process.chdir(dir);
         writeAcquiresFile();
         writeClusterFiles({
-            nodes: [],
+            nodes: [{
+                pubkey: removePk,
+                contractId: 'cid',
+                isUnl: true,
+                signerAddress: 'rOldSigner',
+                lifeMoments: 1,
+                targetLifeMoments: 1,
+                owner: 1,
+                status: { status: 1, onLcl: 1 },
+                domain: 'd.example',
+                peerPort: 9,
+            }],
             pendingNodes: [],
-            operations: [{ type: OperationType.ADD_NODE, ref: ADD_REF, data: { acquireOptions: {}, lifeMoments: 1 } }],
+            operations: [{
+                type: OperationType.REMOVE_NODE,
+                ref: removePk,
+                data: { nodePubkey: removePk, force: true, step: 'UNL' },
+            }],
         });
-        const sharedHash = '0xacquire_once_matrix3';
-        let acquireCalls = 0;
-        const harness = createAcquireTxHarness();
-        for (let lcl = 100; lcl <= 400; lcl += 4) {
-            ledger.setGlobalValidatedIndex(10_000 + lcl);
-            ledger.putTxAt(10_050, {
-                hash: sharedHash,
-                resultCode: 'tesSUCCESS',
-                lastLedgerSequence: 10_060,
-            });
-            const ctx = buildClusterContext({
-                ...harness.evernodeOverrides,
-                acquireNode: async (opts, opRef) => {
-                    acquireCalls++;
-                    harness.pendingTxHashes.add(sharedHash);
-                    harness.syncAcquiresFile?.();
-                    writeAcquiresFile({
-                        pendingAcquires: [{
-                            refId: sharedHash,
-                            host: 'h',
-                            leaseOfferIdx: '1',
-                            messageKey: 'mk',
-                            acquireSentOnLcl: lcl,
-                            opRef,
-                            acquireLedgerCap: 10_060,
-                        }],
-                        acquiredNodes: [],
-                    });
-                    if (lcl === 100)
-                        throw new Error('rpc timeout after submit');
-                    return { refId: sharedHash, host: 'h', opRef, acquireLedgerCap: 10_060 };
-                },
-                xrplContext: xahauStub(ledger, 'n0'),
-            }, { lclSeqNo: lcl });
-            await ctx.init();
-            await ctx.deinit();
-        }
-        assert.strictEqual(acquireCalls, 1);
-        const pending = readAcquiresFile().pendingAcquires;
-        assert.ok(pending.some((p) => p.refId === sharedHash));
+        ledger.setSignerListAt(anchor, { signerQuorum: 1, signerList: [{ account: 'rOther', weight: 1 }] });
+        let replaceCalls = 0;
+        const { buildClusterContext } = require('./cluster-test-helpers');
+        const { xahauStub } = require('./queue-sim-harness');
+        const ctx = buildClusterContext({
+            xrplContext: {
+                ...xahauStub(ledger, 'n0'),
+                replaceSignerList: async () => { replaceCalls++; },
+            },
+        }, {
+            lclSeqNo: 200,
+            lclHash: 'cafebabe00cafebabe00cafebabe00cafebabe',
+            getContractConfig: async () => ({
+                unl: [removePk],
+                evernode: { hosts: ['host.alpha'], feeCeiling: '12000000' },
+                consensus: { roundtime: 1000, stage_slice: 100 },
+            }),
+            getContractUnl: () => [{ publicKey: removePk }],
+            updateContractConfig: async (cfg) => cfg,
+            updatePeers: async () => {},
+        });
+        ledger.setGlobalValidatedIndex(anchor);
+        await ctx.init();
+        await ctx.deinit();
+        assert.strictEqual(replaceCalls, 0);
+        const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.ok(ops.operations.length <= 1);
     });
 
     it('matrix 6: lagging node aborts without persisting', async () => {
@@ -172,7 +280,10 @@ describe('queue-sim (shared FakeXahau ledger)', () => {
         const before = fs.readFileSync(path.join(dirs[2], 'operations.json'), 'utf8');
         ledger.setGlobalValidatedIndex(1000);
         ledger.setNodeValidatedIndex('n2', 500);
+        resetNodeContexts();
         process.chdir(dirs[2]);
+        const { buildClusterContext } = require('./cluster-test-helpers');
+        const { xahauStub } = require('./queue-sim-harness');
         const ctx = buildClusterContext({ xrplContext: xahauStub(ledger, 'n2') }, { lclSeqNo: 200 });
         await ctx.init();
         assert.strictEqual(ctx.isRoundAborted(), true);
@@ -182,80 +293,44 @@ describe('queue-sim (shared FakeXahau ledger)', () => {
     });
 
     it('acquire tx canonical bytes match across 5 nodes (evidence)', async () => {
+        const anchor = 10_000;
         const dirs = initNodeDirs(workRoot, 99, () => ({
             nodes: [],
             pendingNodes: [],
-            operations: [{ type: OperationType.ADD_NODE, ref: ADD_REF, data: { acquireOptions: {}, lifeMoments: 1 } }],
+            operations: [addOp(ADD_REF, 100, anchor)],
         }));
-        const canonicalByNode = [];
-        const fields = {
-            sequence: 42,
-            lastLedgerSequence: 10_010,
-            fee: '12',
-            account: 'rTenant',
-            memos: [{ Memo: { MemoData: '74657374' } }],
-        };
-        const expected = FakeXahauLedger.acquireTxCanonicalBytes(fields).toString('hex');
-        for (let i = 0; i < NODE_COUNT; i++) {
-            process.chdir(dirs[i]);
-            const ctx = buildClusterContext({
-                acquireNode: async () => {
-                    const bytes = FakeXahauLedger.acquireTxCanonicalBytes(fields);
-                    canonicalByNode.push(bytes.toString('hex'));
-                    return { refId: `0x${bytes.toString('hex').slice(0, 16)}`, host: 'h' };
-                },
-            }, { lclSeqNo: 100, lclHash: 'aabbccdd' });
-            await ctx.init();
-            await ctx.deinit();
-        }
-        for (const c of canonicalByNode)
-            assert.strictEqual(c, expected);
-        assert.strictEqual(new Set(canonicalByNode).size, 1);
+        resetNodeContexts();
+        ledger.setGlobalValidatedIndex(anchor);
+        await runAllNodesOneRound({ dirs, ledger, lcl: 100, hooks: { round: 0 } });
+        const submits = ledger.submittedAcquires;
+        assert.strictEqual(submits.length, NODE_COUNT);
+        const first = FakeXahauLedger.acquireTxCanonicalBytes(submits[0].fields).toString('hex');
+        for (const s of submits)
+            assert.strictEqual(FakeXahauLedger.acquireTxCanonicalBytes(s.fields).toString('hex'), first);
+        assert.strictEqual(new Set(submits.map((s) => s.hash)).size, 1);
     });
 
     it('matrix 7: 11 seeds x 100 rounds — 0 divergence', async () => {
         for (let seed = 0; seed < 11; seed++) {
-            const rng = mulberry32(seed + 1000);
             const seedRoot = path.join(workRoot, `seed${seed}`);
             fs.mkdirSync(seedRoot, { recursive: true });
+            const anchor = 20_000 + seed * 1000;
+            const ref = `${ADD_REF}_${seed}`;
             const dirs = initNodeDirs(seedRoot, seed, () => ({
                 nodes: [],
                 pendingNodes: [],
-                operations: [{ type: OperationType.ADD_NODE, ref: `${ADD_REF}_${seed}`, data: { acquireOptions: {}, lifeMoments: 1 } }],
+                operations: [addOp(ref, 500, anchor)],
             }));
+            resetNodeContexts();
             for (let round = 0; round < 100; round++) {
-                ledger.setGlobalValidatedIndex(20_000 + seed * 1000 + round);
-                const sharedRef = `0xacquire_s${seed}_r${round}`;
-                const { hashes, aborted } = await runAllNodesOneRound({
+                ledger.setGlobalValidatedIndex(anchor + round);
+                const { hashes } = await runAllNodesOneRound({
                     dirs,
                     ledger,
                     lcl: 500 + round * 4,
-                    hooks: {
-                        evernodeForNode: (i, harness) => ({
-                            acquireNode: async (opts, opRef) => {
-                                harness.pendingTxHashes.add(sharedRef);
-                                writeAcquiresFile({
-                                    pendingAcquires: [{
-                                        refId: sharedRef,
-                                        host: 'h',
-                                        leaseOfferIdx: '1',
-                                        messageKey: 'mk',
-                                        acquireSentOnLcl: 0,
-                                        opRef,
-                                        acquireLedgerCap: 20_000 + seed * 1000 + round + 3,
-                                    }],
-                                    acquiredNodes: [],
-                                });
-                                return { refId: sharedRef, host: 'h', opRef, acquireLedgerCap: 20_000 + seed * 1000 + round + 3 };
-                            },
-                            getAcquireDataSnapshot: () => readAcquiresFile(),
-                            getIfPending: (refId) => readAcquiresFile().pendingAcquires.find((p) => p.refId === refId) || null,
-                        }),
-                    },
+                    hooks: { round },
                 });
-                syncDirsFromLeader(dirs, 0);
-                const roundHashes = dirs.map((d) => stateSha256(d));
-                assertHashConsensus(roundHashes);
+                assertHashConsensus(hashes);
             }
         }
     });

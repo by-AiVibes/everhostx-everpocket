@@ -33,15 +33,19 @@ describe('Operation queue order (FIFO among ready ops)', () => {
     });
 
     it('runs ADD before a later ready REMOVE (no aliveness deferral)', async () => {
+        const { deriveMessagePublicKey } = require('../../dist/cluster/DeterministicTx');
+        const addRef = 'add_first_in_queue';
+        const messagePublicKey = deriveMessagePublicKey({ anchorLedger: 1_000_000, tenantSequence: 1, lclSeqNo: 100 }, addRef);
         let acquireCalls = 0;
+        const deferred = [];
         writeClusterFiles({
             nodes: [defaultClusterNode(SECOND_REMOVE_PUBKEY)],
             pendingNodes: [],
             operations: [
                 {
                     type: OperationType.ADD_NODE,
-                    ref: 'add_first_in_queue',
-                    data: { acquireOptions: {}, lifeMoments: 1, maxLifeMoments: 0 },
+                    ref: addRef,
+                    data: { acquireOptions: {}, lifeMoments: 1, maxLifeMoments: 0, messagePublicKey },
                 },
                 {
                     type: OperationType.REMOVE_NODE,
@@ -52,15 +56,23 @@ describe('Operation queue order (FIFO among ready ops)', () => {
         });
 
         const ctx = buildClusterContext({
-            acquireNode: async () => {
+            applyDeferredAcquireWrites: () => {
+                const data = JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
+                deferred.forEach((p) => data.pendingAcquires.push(p));
+                deferred.length = 0;
+                fs.writeFileSync('acquires.json', JSON.stringify(data));
+            },
+            acquireNodeFromSnapshot: async () => {
                 acquireCalls++;
-                return {
-                    refId: 'new_acquire_ref',
-                    host: 'host.example',
-                };
+                const p = { refId: 'new_acquire_ref', host: 'host.example', opRef: addRef, leaseOfferIdx: '1', messageKey: 'mk', acquireSentOnLcl: 0, acquireLedgerCap: 999_000 };
+                deferred.push(p);
+                return p;
             },
         });
 
+        await ctx.init();
+        await ctx.deinit();
+        ctx.hpContext.lclSeqNo = 104;
         await ctx.init();
         await ctx.deinit();
 
@@ -75,7 +87,8 @@ describe('Operation queue order (FIFO among ready ops)', () => {
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(cluster.nodes.some((n) => n.pubkey === SECOND_REMOVE_PUBKEY));
-        assert.ok(cluster.pendingNodes.length >= 1);
+        const acquires = JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
+        assert.ok(acquires.pendingAcquires.some((p) => p.opRef === addRef));
     });
 
     it('runs the first queued REMOVE before a later ready REMOVE', async () => {

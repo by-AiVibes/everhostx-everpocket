@@ -85,46 +85,65 @@ describe('Operation agreed-state guards (behavioral)', () => {
     });
 
     it('does not treat ADD as complete when only a different pending acquire exists', async () => {
+        const { deriveMessagePublicKey } = require('../../dist/cluster/DeterministicTx');
+        const messagePublicKey = deriveMessagePublicKey({ anchorLedger: 1_000_000, tenantSequence: 1, lclSeqNo: 100 }, ADD_REF);
         writeClusterFiles({
             nodes: [],
             pendingNodes: [{ refId: '0xtx_other', opRef: OTHER_PENDING_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
             operations: [{
                 type: OperationType.ADD_NODE,
                 ref: ADD_REF,
-                data: { acquireOptions: {}, lifeMoments: 1 },
+                data: { acquireOptions: {}, lifeMoments: 1, messagePublicKey },
             }],
         });
         let acquired = false;
+        const deferred = [];
         const ctx = buildClusterContext({
-            acquireNode: async () => {
+            applyDeferredAcquireWrites: () => {
+                const data = JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
+                deferred.forEach((p) => data.pendingAcquires.push(p));
+                deferred.length = 0;
+                fs.writeFileSync('acquires.json', JSON.stringify(data));
+            },
+            acquireNodeFromSnapshot: async () => {
                 acquired = true;
-                return { refId: '0xtx_new_add', host: 'h' };
+                const p = { refId: '0xtx_new_add', host: 'h', opRef: ADD_REF, leaseOfferIdx: '1', messageKey: 'mk', acquireSentOnLcl: 0, acquireLedgerCap: 999_000 };
+                deferred.push(p);
+                return p;
             },
             getIfPending: (refId) => refId === '0xtx_other',
         });
         await ctx.init();
         await ctx.deinit();
+        ctx.hpContext.lclSeqNo = 104;
+        await ctx.init();
+        await ctx.deinit();
         assert.strictEqual(acquired, true);
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
-        const pending = JSON.parse(fs.readFileSync('cluster.json', 'utf8')).pendingNodes;
-        assert.ok(pending.some((p) => p.opRef === ADD_REF));
-        assert.ok(pending.some((p) => p.opRef === OTHER_PENDING_REF));
+        const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
+        const acquires = JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
+        assert.ok(acquires.pendingAcquires.some((p) => p.opRef === ADD_REF));
+        assert.ok(cluster.pendingNodes.some((p) => p.opRef === OTHER_PENDING_REF));
     });
 
     it('dequeues ADD when this op pending acquire was already in agreed state at round start', async () => {
+        writeAcquiresFile({
+            acquiredNodes: [{ refId: '0xtx_add', host: 'h', name: 'inst', domain: 'd', pubkey: 'pk' }],
+            pendingAcquires: [],
+        });
         writeClusterFiles({
             nodes: [],
             pendingNodes: [{ refId: '0xtx_add', opRef: ADD_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
             operations: [{
                 type: OperationType.ADD_NODE,
                 ref: ADD_REF,
-                data: { acquireOptions: {}, lifeMoments: 1 },
+                data: { acquireOptions: {}, lifeMoments: 1, acquireTxHash: '0xtx_add', acquireLedgerCap: 1_000_000 },
             }],
         });
         let acquireCalls = 0;
         const ctx = buildClusterContext({
-            acquireNode: async () => {
+            acquireNodeFromSnapshot: async () => {
                 acquireCalls++;
                 throw new Error('must not acquire');
             },
