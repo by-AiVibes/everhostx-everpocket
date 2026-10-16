@@ -91,7 +91,7 @@ describe('Phase 1 queue core', () => {
         assert.strictEqual(ops.operations[0].attempt ?? 0, 0);
     });
 
-    it('aborts round without persisting when anchorLedger is zero', async () => {
+    it('aborts round without persisting when anchorLedger is zero and config has no bootstrap anchor', async () => {
         writeClusterFiles({
             nodes: [defaultClusterNode(EXTEND_PUBKEY)],
             operations: [{
@@ -101,7 +101,14 @@ describe('Phase 1 queue core', () => {
             }],
             anchorLedger: 0,
         });
-        const ctx = buildClusterContext();
+        const ctx = buildClusterContext({}, {
+            getContractConfig: async () => ({
+                unl: [],
+                evernode: { hosts: ['host.alpha', 'host.beta'], feeCeiling: '12000000' },
+                consensus: { roundtime: 1000, stage_slice: 100 },
+                max_input_ledger_offset: 32,
+            }),
+        });
         await ctx.init();
         assert.strictEqual(ctx.isRoundAborted(), true);
         await ctx.deinit();
@@ -152,10 +159,11 @@ describe('Phase 1 queue core', () => {
         assert.strictEqual(node.lifeMoments, 1);
     });
 
-    it('dequeues EXTEND when agreed ledger shows tesSUCCESS at cap', async () => {
-        const { computeExtendTxHash } = require('../../dist/cluster/DeterministicTx');
-        const { RoundSnapshot } = require('../../dist/cluster/RoundSnapshot');
+    it('dequeues EXTEND when quorum observations report tesSUCCESS with real tx hash', async () => {
+        const { unlPubkey } = require('./consensus-input-helpers');
+        const { quorumExtendObservationMessages } = require('./consensus-test-helpers');
         const lls = DEFAULT_ANCHOR + 30;
+        const realHash = 'abcd1234real_xahau_tx_hash';
         const nodes = [{
             ...defaultClusterNode(EXTEND_PUBKEY),
             lifeMoments: 1,
@@ -170,28 +178,31 @@ describe('Phase 1 queue core', () => {
                 data: { nodePubkey: EXTEND_PUBKEY, moments: 4 },
             }],
         });
-        const op = { type: OperationType.EXTEND_NODE, ref: EXTEND_PUBKEY, data: { nodePubkey: EXTEND_PUBKEY, moments: 4 } };
-        const snap = RoundSnapshot.capture({
-            lclSeqNo: 100,
-            lclHash: 'hash',
-            operationData: JSON.parse(fs.readFileSync('operations.json', 'utf8')),
-            clusterData: { initialized: true, nodes, pendingNodes: [] },
-            acquireData: { acquiredNodes: [], pendingAcquires: [] },
-            contractUnl: [],
-            signerListInfo: null,
-            tenantSequence: 42,
-            tenantAddress: 'rTenantAgreedAddress',
-            feeCeiling: '12000000',
-            hostList: ['host.alpha', 'host.beta'],
-            extendLedgerChecks: [],
+        const unl = [0, 1, 2, 3, 4].map((i) => unlPubkey(i));
+        const ctx = buildClusterContext({}, {
+            getContractConfig: async () => ({
+                unl,
+                evernode: {
+                    hosts: ['host.alpha', 'host.beta'],
+                    feeCeiling: '12000000',
+                    anchorLedger: DEFAULT_ANCHOR,
+                    tenantSequence: 42,
+                },
+                consensus: { roundtime: 1000, stage_slice: 100 },
+                max_input_ledger_offset: 32,
+            }),
         });
-        const hash = computeExtendTxHash(snap, op);
-        const ledgerHooks = {
-            getTxAt: async (h, idx) => (h === hash && idx === lls ? { resultCode: 'tesSUCCESS', lastLedgerSequence: lls } : null),
-            getValidatedLedgerIndex: () => lls,
-            getAccountSequenceAt: async () => 42,
-        };
-        const ctx = buildClusterContext({ xrplContext: ledgerHooks }, {}, ledgerHooks);
+        const messages = quorumExtendObservationMessages({
+            anchorLedger: DEFAULT_ANCHOR,
+            tenantSequence: 42,
+            opRef: EXTEND_PUBKEY,
+            txHash: realHash,
+            lastLedgerSequence: lls,
+        });
+        await ctx.processConsensusUserInputs({
+            list: () => messages.map((m, idx) => ({ publicKey: m.userPublicKey, inputs: [[idx, m.payload.length]] })),
+            read: async ([idx]) => messages[idx].payload,
+        });
         await ctx.init();
         await ctx.deinit();
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));

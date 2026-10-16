@@ -94,6 +94,8 @@ export interface OperationData {
   agreedExtendResults?: Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }>;
   nodeUserRegistrations?: Record<string, string>;
   observationDedup?: Record<string, { nonce: number; observedLcl: number }>;
+  /** Tenant sequences for which a quorum-confirmed extend already landed; never resubmit at these. */
+  consumedTenantSequences?: number[];
 }
 
 export enum ClusterMessageType {

@@ -295,6 +295,7 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
         });
     }
 
+    const quorum = quorumThreshold(contractUnl.length);
     const result = aggregateAnchorFromObservations(accepted, contractUnl);
     if (result) {
         const prev = operationData.anchorLedger ?? 0;
@@ -304,9 +305,13 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
             operationData.agreedTenantSequence = result.tenantSequence;
             operationData.agreedSignerListHash = result.signerListHash;
         }
+    }
+
+    const extendMerged = mergeAgreedExtendResults(accepted, quorum);
+    if (Object.keys(extendMerged).length > 0) {
         operationData.agreedExtendResults = {
             ...(operationData.agreedExtendResults || {}),
-            ...result.agreedExtendResults,
+            ...extendMerged,
         };
     }
 

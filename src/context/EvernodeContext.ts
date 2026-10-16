@@ -10,10 +10,14 @@ import { JSONHelpers } from "../utils";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
 import { error, log } from "../helpers/logger";
+import { Peer } from "../models";
+import { buildAnchorObservationPayload, ObservationSubmitter } from "../observation/ObservationSubmitter";
+import { SubmittedTxObservation } from "../cluster/AnchorObservation";
 import NumberHelpers from "../utils/helpers/NumberHelper";
 
 const TIMEOUT = 10000;
 const ACQUIRE_ABANDON_LCL_THRESHOLD = 10;
+const OBSERVATION_PENDING_FILE = 'observation_pending_submits.json';
 
 class EvernodeContext {
     private acquireDataFile: string = "acquires.json";
@@ -392,7 +396,57 @@ class EvernodeContext {
         const preparedAcquireTxn = await tenantClient.prepareExtendLeaseTransaction(hostAddress, ((uriInfo.leaseAmount * extension)).toString(), tokenID, options)
         await tenantClient.disconnect();
 
-        return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
+        const res = await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
+        this.#recordObservationPendingSubmit(options, res);
+        return res;
+    }
+
+    #recordObservationPendingSubmit(options: any, res: any): void {
+        if (!options?.extendOpRef || !res?.hash)
+            return;
+        const entry: SubmittedTxObservation = {
+            ref: options.extendOpRef,
+            hash: res.hash,
+            lastLedgerSequence: options.txSubmitInfo?.maxLedgerSequence ?? 0,
+            resultCode: res.code === 'tesSUCCESS' ? 'tesSUCCESS' : (res.code || 'unknown'),
+        };
+        let pending: SubmittedTxObservation[] = [];
+        if (fs.existsSync(OBSERVATION_PENDING_FILE))
+            pending = JSON.parse(fs.readFileSync(OBSERVATION_PENDING_FILE, 'utf8'));
+        pending.push(entry);
+        fs.writeFileSync(OBSERVATION_PENDING_FILE, JSON.stringify(pending));
+    }
+
+    /**
+     * Out-of-band HotPocket user input with this node's local ledger view. Never mutates agreed state.
+     */
+    public async submitRoundObservationOutOfBand(peers: Peer[]): Promise<void> {
+        try {
+            const submittedTx: SubmittedTxObservation[] = fs.existsSync(OBSERVATION_PENDING_FILE)
+                ? JSON.parse(fs.readFileSync(OBSERVATION_PENDING_FILE, 'utf8'))
+                : [];
+            const validatedIndex = this.xrplContext.getValidatedLedgerIndex();
+            const tenantAddress = this.xrplContext.xrplAcc?.address;
+            if (!tenantAddress)
+                return;
+            const tenantSequence = await this.xrplContext.getAccountSequenceAt(tenantAddress, validatedIndex);
+            const ledgerHash = `local_${validatedIndex}`;
+            const payload = buildAnchorObservationPayload({
+                observedLcl: this.hpContext.lclSeqNo,
+                observedLclHash: this.hpContext.lclHash,
+                nonce: this.hpContext.lclSeqNo,
+                validatedIndex,
+                ledgerHash,
+                tenantSequence,
+                signerListHash: 'local_signer_hash',
+                submittedTx,
+            });
+            const submitter = new ObservationSubmitter(this.hpContext, peers);
+            await submitter.submitObservation(payload);
+            fs.writeFileSync(OBSERVATION_PENDING_FILE, JSON.stringify([]));
+        } catch (e) {
+            error(e);
+        }
     }
 
     /**

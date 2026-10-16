@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 function ledgerPath(root) {
     return path.join(root, 'shared-ledger.json');
@@ -28,6 +29,9 @@ function initLedger(root, { anchor, tenantSequence, tenantAddress }) {
         txs: {},
         accountSequences: { [`${anchor}:${tenantAddress}`]: tenantSequence },
         signerLists: {},
+        landedHashes: {},
+        landedCountByRef: {},
+        nodePendingSubmits: {},
     });
 }
 
@@ -50,6 +54,16 @@ function mergeSubmitIntents(root, round) {
         fs.unlinkSync(path.join(root, file));
     }
     writeLedger(root, ledger);
+}
+
+function realTxHash(seed, round, nodeId, sequence, opRef) {
+    return crypto.createHash('sha256')
+        .update(`${seed}|${round}|${nodeId}|${sequence}|${opRef}`)
+        .digest('hex');
+}
+
+function ledgerHashAt(index) {
+    return crypto.createHash('sha256').update(`ledger-${index}`).digest('hex');
 }
 
 function ledgerBackendFromPinned(root, round, nodeId) {
@@ -76,9 +90,39 @@ function ledgerBackendFromPinned(root, round, nodeId) {
                 throw new Error(`No sequence at ${ledgerIndex} for ${account}`);
             return seq;
         },
-        recordSubmitIntent: (tx) => {
+        getPendingSubmitsForNode: () => {
+            const data = read();
+            return data.nodePendingSubmits[nodeId] ?? [];
+        },
+        recordSubmitIntent: ({ ref, hash, lastLedgerSequence, sequence }) => {
+            const ledger = readLedger(root);
+            if ((ledger.landedCountByRef[ref] || 0) >= 1)
+                return;
+            if (!ledger.landedHashes[hash]) {
+                ledger.landedHashes[hash] = true;
+                ledger.landedCountByRef[ref] = 1;
+            }
+            const tx = {
+                hash,
+                resultCode: 'tesSUCCESS',
+                lastLedgerSequence,
+                ledgerIndex: lastLedgerSequence,
+                sequence,
+            };
+            ledger.txs[`${lastLedgerSequence}:${hash}`] = tx;
+            if (!ledger.nodePendingSubmits[nodeId])
+                ledger.nodePendingSubmits[nodeId] = [];
+            ledger.nodePendingSubmits[nodeId].push({
+                ref,
+                hash,
+                lastLedgerSequence,
+                resultCode: 'tesSUCCESS',
+            });
+            writeLedger(root, ledger);
             fs.writeFileSync(submitPath(root, nodeId, round), JSON.stringify({ tx }));
         },
+        ledgerHashAt,
+        realTxHash,
     };
 }
 
@@ -90,4 +134,6 @@ module.exports = {
     writePinnedRound,
     mergeSubmitIntents,
     pinnedPath,
+    realTxHash,
+    ledgerHashAt,
 };

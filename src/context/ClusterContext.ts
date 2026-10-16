@@ -14,14 +14,15 @@ import {
     operationNextAttemptLcl,
 } from "../cluster/OperationQueueProcessor";
 import { FrozenRoundSnapshot, RoundSnapshot } from "../cluster/RoundSnapshot";
-import { computeExtendTxHash, pickHostForOpRef } from "../cluster/DeterministicTx";
-import { extendLastLedgerSequence } from "../cluster/OperationQueueProcessor";
+import { pickHostForOpRef } from "../cluster/DeterministicTx";
 import { AllVoteElector } from "../vote/vote-electors";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
 import { error, info, log } from "../helpers/logger";
 import { JSONHelpers } from "../utils";
 import { applyObservationInputs, parseAnchorUserMessage, ANCHOR_OBSERVATION_MESSAGE_TYPE, NODE_USER_REGISTER_MESSAGE_TYPE } from "../cluster/AnchorObservation";
+import { requireMaxInputLedgerOffset } from "../cluster/QueueConfig";
+import { readTenantSequence } from "../cluster/DeterministicTx";
 const DUMMY_OWNER_PUBKEY = "dummy_owner_pubkey";
 const SASHIMONO_NODEJS_IMAGE = "evernodedev/sashimono:hp.0.6.4-ubt.20.04-njs.20";
 const ALIVENESS_CHECK_THRESHOLD = 5;
@@ -44,6 +45,7 @@ class ClusterContext {
     private acknowledgeRetryLclThreshold: number;
     private initialized: boolean = false;
     private roundAborted: boolean = false;
+    private pendingConsensusMessages: { userPublicKey: string; payload: Buffer }[] = [];
     public hpContext: HotPocketContext;
     public voteContext: VoteContext;
     public evernodeContext: EvernodeContext;
@@ -76,11 +78,20 @@ class ClusterContext {
 
         try {
             await this.evernodeContext.bootstrapForRound();
-            const snapshot = await this.#captureRoundSnapshot();
-            if (snapshot.anchorLedger <= 0) {
+            await this.flushConsensusInputsForRound();
+            await this.#bootstrapQueueState();
+            const config = await this.hpContext.getContractConfig();
+            const evernodeCfg = (config as { evernode?: { anchorLedger?: number; tenantSequence?: number } }).evernode;
+            const anchor = this.operationData.anchorLedger ?? evernodeCfg?.anchorLedger;
+            if (!anchor || anchor <= 0) {
                 this.roundAborted = true;
                 return;
             }
+            if (this.operationData.agreedTenantSequence === undefined && evernodeCfg?.tenantSequence === undefined) {
+                this.roundAborted = true;
+                return;
+            }
+            const snapshot = await this.#captureRoundSnapshot();
 
             await this.evernodeContext.xrplContext.reconcileValidatedTransactions(snapshot.anchorLedger);
             await this.evernodeContext.finishRoundInit();
@@ -124,27 +135,33 @@ class ClusterContext {
     public async ingestUserInput(user: User, msg: Buffer): Promise<ClusterMessageResponse | void> {
         const parsed = parseAnchorUserMessage(msg);
         if (parsed && (parsed.type === ANCHOR_OBSERVATION_MESSAGE_TYPE || parsed.type === NODE_USER_REGISTER_MESSAGE_TYPE)) {
-            const config = await this.hpContext.getContractConfig();
-            const maxOffset = config.max_input_ledger_offset ?? 0;
-            applyObservationInputs({
-                operationData: this.operationData,
-                contractUnl: config.unl,
-                currentLcl: this.hpContext.lclSeqNo,
-                maxInputLedgerOffset: maxOffset,
-                messages: [{ userPublicKey: user.publicKey, payload: msg }],
-            });
-            this.updatedData = true;
+            this.pendingConsensusMessages.push({ userPublicKey: user.publicKey, payload: msg });
             return;
         }
         return this.feedUserMessage(user, msg);
+    }
+
+    public async flushConsensusInputsForRound(extraMessages: { userPublicKey: string; payload: Buffer }[] = []): Promise<void> {
+        const messages = [...this.pendingConsensusMessages, ...extraMessages];
+        this.pendingConsensusMessages = [];
+        if (!messages.length)
+            return;
+        const config = await this.hpContext.getContractConfig();
+        const maxOffset = requireMaxInputLedgerOffset(config);
+        applyObservationInputs({
+            operationData: this.operationData,
+            contractUnl: config.unl,
+            currentLcl: this.hpContext.lclSeqNo,
+            maxInputLedgerOffset: maxOffset,
+            messages,
+        });
+        this.updatedData = true;
     }
 
     public async processConsensusUserInputs(contractUsers: {
         list(): { publicKey: string; inputs: [number, number][] }[];
         read(input: [number, number]): Promise<Buffer>;
     }): Promise<void> {
-        const config = await this.hpContext.getContractConfig();
-        const maxOffset = config.max_input_ledger_offset ?? 0;
         const messages: { userPublicKey: string; payload: Buffer }[] = [];
         for (const user of contractUsers.list()) {
             for (const input of user.inputs) {
@@ -152,13 +169,22 @@ class ClusterContext {
                 messages.push({ userPublicKey: user.publicKey, payload: buf });
             }
         }
-        if (applyObservationInputs({
-            operationData: this.operationData,
-            contractUnl: config.unl,
-            currentLcl: this.hpContext.lclSeqNo,
-            maxInputLedgerOffset: maxOffset,
-            messages,
-        }).length >= 0)
+        await this.flushConsensusInputsForRound(messages);
+    }
+
+    async #bootstrapQueueState(): Promise<void> {
+        const config = await this.hpContext.getContractConfig();
+        const evernodeCfg = (config as { evernode?: { anchorLedger?: number; tenantSequence?: number } }).evernode;
+        let changed = false;
+        if ((!this.operationData.anchorLedger || this.operationData.anchorLedger <= 0) && evernodeCfg?.anchorLedger) {
+            this.operationData.anchorLedger = evernodeCfg.anchorLedger;
+            changed = true;
+        }
+        if (this.operationData.agreedTenantSequence === undefined && evernodeCfg?.tenantSequence !== undefined) {
+            this.operationData.agreedTenantSequence = evernodeCfg.tenantSequence;
+            changed = true;
+        }
+        if (changed)
             this.updatedData = true;
     }
 
@@ -176,22 +202,14 @@ class ClusterContext {
             throw new Error('Missing tenant address for queue snapshot');
 
         const anchor = this.operationData.anchorLedger ?? evernodeCfg.anchorLedger;
-        if (anchor === undefined)
+        if (anchor === undefined || anchor <= 0)
             throw new Error('Missing anchorLedger in agreed operation or contract state');
 
-        const validated = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
-        const signerList = anchor > 0 && validated >= anchor
-            ? await this.evernodeContext.xrplContext.getSignerListAt(anchor)
-            : null;
+        const tenantSequence = this.operationData.agreedTenantSequence;
+        if (tenantSequence === undefined)
+            throw new Error('Missing agreedTenantSequence; bootstrap from config or observation quorum required');
 
-        let tenantSequence = 0;
-        if (anchor > 0 && validated >= anchor) {
-            if (this.operationData.agreedTenantSequence !== undefined
-                && this.operationData.anchorLedger === anchor)
-                tenantSequence = this.operationData.agreedTenantSequence;
-            else
-                tenantSequence = await this.evernodeContext.xrplContext.getAccountSequenceAt(tenantAddress, anchor);
-        }
+        const signerList = null;
 
         const operationDataCopy = JSON.parse(JSON.stringify(this.operationData));
         const preSnap = {
@@ -213,32 +231,16 @@ class ClusterContext {
         for (const op of operationDataCopy.operations) {
             if (op.type !== OperationType.EXTEND_NODE)
                 continue;
-            const snapForHash = RoundSnapshot.capture({
-                lclSeqNo: preSnap.lclSeqNo,
-                lclHash: preSnap.lclHash,
-                operationData: operationDataCopy,
-                clusterData: preSnap.cluster,
-                acquireData: preSnap.acquireData,
-                contractUnl: preSnap.unl,
-                signerListInfo: signerList,
-                tenantSequence: preSnap.tenantSequence,
-                tenantAddress: preSnap.tenantAddress,
-                feeCeiling: preSnap.feeCeiling,
-                hostList: preSnap.hostList,
-                extendLedgerChecks: [],
-            });
-            const hash = computeExtendTxHash(snapForHash, op);
-            const lls = extendLastLedgerSequence(snapForHash);
             const agreed = this.operationData.agreedExtendResults?.[op.ref];
-            let tx = validated >= lls
-                ? await this.evernodeContext.xrplContext.getTxAt(hash, lls)
-                : null;
-            if (!tx && agreed && agreed.hash === hash && agreed.resultCode === 'tesSUCCESS')
-                tx = {
+            const hash = agreed?.hash ?? '';
+            const lls = agreed?.lastLedgerSequence ?? 0;
+            const tx = agreed && agreed.resultCode === 'tesSUCCESS'
+                ? {
                     hash: agreed.hash,
                     resultCode: agreed.resultCode,
                     lastLedgerSequence: agreed.lastLedgerSequence,
-                };
+                }
+                : null;
             extendLedgerChecks.push({ ref: op.ref, hash, lastLedgerSequence: lls, tx });
         }
 
@@ -316,12 +318,22 @@ class ClusterContext {
             const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
             if (snapNode && snapNode.lifeMoments < snapNode.targetLifeMoments)
                 this.clusterManager.increaseLifeMoments(data.nodePubkey, data.moments);
+            const seq = readTenantSequence(snapshot);
+            if (!this.operationData.consumedTenantSequences)
+                this.operationData.consumedTenantSequences = [];
+            if (!this.operationData.consumedTenantSequences.includes(seq))
+                this.operationData.consumedTenantSequences.push(seq);
+            this.updatedData = true;
         }
     }
 
     async #performExtendOperation(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<void> {
         const ledger = this.#ledgerReader();
         if (await isOperationComplete(operation, snapshot, ledger))
+            return;
+
+        const seq = readTenantSequence(snapshot);
+        if (this.operationData.consumedTenantSequences?.includes(seq))
             return;
 
         const data = operation.data as ExtendNodeOperation;
@@ -333,6 +345,8 @@ class ClusterContext {
         log(`Extending node ${snapNode.pubkey} by ${data.moments} via host ${host}...`);
         await this.evernodeContext.extendSubmit(host, data.moments, snapNode.name, {
             txSubmitInfo: this.evernodeContext.xrplContext.deriveTxSubmitInfo(snapshot),
+            extendOpRef: operation.ref,
+            extendSequence: seq,
         });
     }
 

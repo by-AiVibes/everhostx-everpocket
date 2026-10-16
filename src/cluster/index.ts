@@ -3,3 +3,4 @@ export * from './RoundSnapshot';
 export * from './DeterministicTx';
 export * from './OperationQueueProcessor';
 export * from './AnchorObservation';
+export * from './QueueConfig';

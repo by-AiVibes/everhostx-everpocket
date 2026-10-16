@@ -13,8 +13,10 @@ function consensusContract(unlPubkeys = []) {
             hosts: ['host.alpha', 'host.beta'],
             feeCeiling: '12000000',
             anchorLedger: DEFAULT_ANCHOR,
+            tenantSequence: DEFAULT_TENANT_SEQUENCE,
         },
         consensus: { roundtime: 1000, stage_slice: 100 },
+        max_input_ledger_offset: 32,
     };
     return {
         state,
@@ -36,7 +38,7 @@ function readAcquiresFile() {
     return JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
 }
 
-function writeClusterFiles({ nodes = [], pendingNodes = [], operations, anchorLedger = DEFAULT_ANCHOR }) {
+function writeClusterFiles({ nodes = [], pendingNodes = [], operations, anchorLedger = DEFAULT_ANCHOR, agreedTenantSequence = DEFAULT_TENANT_SEQUENCE }) {
     fs.writeFileSync('cluster.json', JSON.stringify({
         initialized: true,
         nodes,
@@ -45,6 +47,7 @@ function writeClusterFiles({ nodes = [], pendingNodes = [], operations, anchorLe
     fs.writeFileSync('operations.json', JSON.stringify({
         operations,
         anchorLedger,
+        agreedTenantSequence,
     }, null, 4));
 }
 
@@ -79,8 +82,10 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}, le
                 hosts: ['host.alpha', 'host.beta'],
                 feeCeiling: '12000000',
                 anchorLedger: DEFAULT_ANCHOR,
+                tenantSequence: DEFAULT_TENANT_SEQUENCE,
             },
             consensus: { roundtime: 1000, stage_slice: 100 },
+            max_input_ledger_offset: 32,
         }),
         getContractUnl: () => [],
         updateContractConfig: async () => {},

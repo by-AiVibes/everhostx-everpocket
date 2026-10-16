@@ -7,13 +7,14 @@ const { spawn } = require('child_process');
 
 const { createWorkDir } = require('./test-workdir');
 const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, DEFAULT_ANCHOR, DEFAULT_TENANT_SEQUENCE, TENANT_ADDRESS } = require('./cluster-test-helpers');
-const { initLedger, readLedger, writeLedger, writePinnedRound, mergeSubmitIntents } = require('./shared-ledger-store');
-const { buildConsensusMessages } = require('./consensus-input-helpers');
+const { initLedger, readLedger, writeLedger, writePinnedRound, mergeSubmitIntents, ledgerHashAt } = require('./shared-ledger-store');
 const { OperationType } = require('../../dist/models/cluster');
 
 const NODE_COUNT = 5;
 const EXTEND_PUBKEY = 'sim_extend_pubkey';
 const SHARED_LCL_HASH = 'cafebabe00cafebabe00cafebabe00cafebabe';
+const ROUNDS_PER_SEED = 100;
+const SEED_COUNT = 10;
 
 function stateSha256(dir) {
     const ops = fs.readFileSync(path.join(dir, 'operations.json'));
@@ -45,13 +46,14 @@ function seedNodeDirs(workRoot) {
                 data: { nodePubkey: EXTEND_PUBKEY, moments: 1 },
             }],
             anchorLedger: DEFAULT_ANCHOR,
+            agreedTenantSequence: DEFAULT_TENANT_SEQUENCE,
         }, null, 4));
         dirs.push(dir);
     }
     return dirs;
 }
 
-function runChild(workRoot, nodeDir, seed, round, lcl) {
+function runChild(workRoot, nodeDir, seed, round, lcl, phase) {
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [path.join(__dirname, 'queue-sim-child.js')], {
             env: {
@@ -63,19 +65,32 @@ function runChild(workRoot, nodeDir, seed, round, lcl) {
                 EVP_ROUND: String(round),
                 EVP_LCL: String(lcl),
                 EVP_LCL_HASH: SHARED_LCL_HASH,
+                EVP_PHASE: phase,
             },
             stdio: ['ignore', 'pipe', 'pipe'],
         });
         child.stderr.on('data', (d) => { process.stderr.write(d); });
         child.on('exit', (code) => {
             if (code !== 0)
-                reject(new Error(`child ${nodeDir} exit ${code}`));
-            else {
+                reject(new Error(`child ${nodeDir} ${phase} exit ${code}`));
+            else if (phase === 'exec') {
                 const resultPath = path.join(workRoot, nodeDir, '.evp-round-result.json');
                 resolve(JSON.parse(fs.readFileSync(resultPath, 'utf8')));
-            }
+            } else
+                resolve({ nodeId: nodeDir });
         });
     });
+}
+
+function mergePartialObservations(seedRoot, seed, round) {
+    const inboxDir = path.join(seedRoot, 'inbox');
+    const files = fs.readdirSync(inboxDir)
+        .filter((f) => f.startsWith(`seed-${seed}-r${round}-`))
+        .map((f) => JSON.parse(fs.readFileSync(path.join(inboxDir, f), 'utf8')));
+    const dropIdx = (seed + round) % NODE_COUNT;
+    const messages = files.filter((_, idx) => idx !== dropIdx);
+    assert.strictEqual(messages.length, NODE_COUNT - 1);
+    fs.writeFileSync(path.join(seedRoot, `consensus-inputs-r${round}.json`), JSON.stringify({ messages }));
 }
 
 describe('queue-sim multiprocess (phase 1)', () => {
@@ -97,26 +112,30 @@ describe('queue-sim multiprocess (phase 1)', () => {
         fs.rmSync(workRoot, { recursive: true, force: true });
     });
 
-    it('10 seeds, 5 forked nodes, divergent validated indexes, partial submit failures', async () => {
-        for (let seed = 0; seed < 10; seed++) {
+    it(`${SEED_COUNT} seeds x ${ROUNDS_PER_SEED} rounds: node-produced observations, partial delivery, 0 divergence`, async () => {
+        for (let seed = 0; seed < SEED_COUNT; seed++) {
             const seedRoot = path.join(workRoot, `seed-${seed}`);
             fs.mkdirSync(seedRoot, { recursive: true });
+            fs.mkdirSync(path.join(seedRoot, 'inbox'), { recursive: true });
             initLedger(seedRoot, {
                 anchor: DEFAULT_ANCHOR,
                 tenantSequence: DEFAULT_TENANT_SEQUENCE,
                 tenantAddress: TENANT_ADDRESS,
             });
             const dirs = seedNodeDirs(seedRoot);
-            const rounds = 5 + (seed % 6);
 
-            for (let round = 0; round < rounds; round++) {
+            for (let round = 0; round < ROUNDS_PER_SEED; round++) {
                 const ledger = readLedger(seedRoot);
-                const baseValidated = DEFAULT_ANCHOR + 30 + round;
-                ledger.globalValidatedIndex = baseValidated;
-                for (let i = 0; i < NODE_COUNT; i++)
-                    ledger.nodeValidated[`n${i}`] = baseValidated + (i % 3);
-                writeLedger(seedRoot, ledger);
                 const anchorForPin = JSON.parse(fs.readFileSync(path.join(seedRoot, 'n0', 'operations.json'), 'utf8')).anchorLedger;
+                const baseValidated = anchorForPin + 25 + round;
+                ledger.globalValidatedIndex = baseValidated;
+                for (let i = 0; i < NODE_COUNT; i++) {
+                    const lagRound = (seed + round) % 17 === 0;
+                    ledger.nodeValidated[`n${i}`] = lagRound
+                        ? anchorForPin - 2 - (i % 2)
+                        : baseValidated + (i % 3);
+                }
+                writeLedger(seedRoot, ledger);
                 writePinnedRound(seedRoot, round, {
                     anchor: anchorForPin,
                     tenantAddress: TENANT_ADDRESS,
@@ -124,37 +143,36 @@ describe('queue-sim multiprocess (phase 1)', () => {
                 });
 
                 const lcl = 100 + seed * 10 + round * 4;
-                const proposedAnchor = anchorForPin + 30;
-                fs.writeFileSync(path.join(seedRoot, `consensus-inputs-r${round}.json`), JSON.stringify({
-                    messages: buildConsensusMessages({
-                        validatedIndex: proposedAnchor,
-                        tenantSequence: DEFAULT_TENANT_SEQUENCE,
-                        observedLcl: lcl,
-                        nonce: round + 1,
-                    }),
-                }));
+                for (const d of dirs)
+                    await runChild(seedRoot, d, seed, round, lcl, 'observe');
+                mergePartialObservations(seedRoot, seed, round);
+
                 const results = [];
                 for (const d of dirs)
-                    results.push(await runChild(seedRoot, d, seed, round, lcl));
+                    results.push(await runChild(seedRoot, d, seed, round, lcl, 'exec'));
                 assert.strictEqual(results.length, NODE_COUNT);
 
                 const hashes = dirs
                     .filter((_, i) => !results[i].aborted)
                     .map((d) => stateSha256(path.join(seedRoot, d)));
-                if (hashes.length > 0) {
-                    const first = hashes[0];
-                    for (const h of hashes)
-                        assert.strictEqual(h, first);
-                }
+                assert.ok(hashes.length > 0);
+                const first = hashes[0];
+                for (const h of hashes)
+                    assert.strictEqual(h, first);
 
                 mergeSubmitIntents(seedRoot, round);
             }
+
+            const ledger = readLedger(seedRoot);
+            assert.strictEqual(ledger.landedCountByRef[EXTEND_PUBKEY] ?? 0, 1,
+                `seed ${seed}: expected exactly one landed extend tx per op`);
         }
     });
 
     it('lying minority (1 of 5) does not advance anchor via consensus inputs', async () => {
         const seedRoot = path.join(workRoot, 'liar');
         fs.mkdirSync(seedRoot, { recursive: true });
+        fs.mkdirSync(path.join(seedRoot, 'inbox'), { recursive: true });
         initLedger(seedRoot, {
             anchor: DEFAULT_ANCHOR,
             tenantSequence: DEFAULT_TENANT_SEQUENCE,
@@ -163,22 +181,20 @@ describe('queue-sim multiprocess (phase 1)', () => {
         const dirs = seedNodeDirs(seedRoot);
         const round = 0;
         const lcl = 200;
-        const proposedAnchor = DEFAULT_ANCHOR + 30;
-        const honest = buildConsensusMessages({
-            validatedIndex: DEFAULT_ANCHOR,
+        writePinnedRound(seedRoot, round, {
+            anchor: DEFAULT_ANCHOR,
+            tenantAddress: TENANT_ADDRESS,
             tenantSequence: DEFAULT_TENANT_SEQUENCE,
-            observedLcl: lcl,
         });
-        const liarPk = require('./consensus-input-helpers').unlPubkey(0);
-        const liarPayload = require('./consensus-input-helpers').buildConsensusMessages({
-            validatedIndex: proposedAnchor,
-            tenantSequence: DEFAULT_TENANT_SEQUENCE,
-            observedLcl: lcl,
-            liarNodeIndex: 0,
-        })[0].payload;
-        const messages = honest.map((m) => (m.userPublicKey === liarPk
-            ? { userPublicKey: liarPk, payload: liarPayload }
-            : m));
+        for (const d of dirs)
+            await runChild(seedRoot, d, 0, round, lcl, 'observe');
+        const inboxDir = path.join(seedRoot, 'inbox');
+        const messages = fs.readdirSync(inboxDir).map((f) => JSON.parse(fs.readFileSync(path.join(inboxDir, f), 'utf8')));
+        const liar = messages[0];
+        const parsed = JSON.parse(liar.payload);
+        parsed.validatedIndex = DEFAULT_ANCHOR + 30;
+        parsed.ledgerHash = 'LIAR_HASH';
+        liar.payload = JSON.stringify(parsed);
         fs.writeFileSync(path.join(seedRoot, `consensus-inputs-r${round}.json`), JSON.stringify({ messages }));
         writePinnedRound(seedRoot, round, {
             anchor: DEFAULT_ANCHOR,
@@ -186,7 +202,7 @@ describe('queue-sim multiprocess (phase 1)', () => {
             tenantSequence: DEFAULT_TENANT_SEQUENCE,
         });
         for (const d of dirs)
-            await runChild(seedRoot, d, 0, round, lcl);
+            await runChild(seedRoot, d, 0, round, lcl, 'exec');
         const anchorAfter = JSON.parse(fs.readFileSync(path.join(seedRoot, 'n0', 'operations.json'), 'utf8')).anchorLedger;
         assert.strictEqual(anchorAfter, DEFAULT_ANCHOR);
     });
