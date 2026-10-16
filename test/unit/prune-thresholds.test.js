@@ -103,6 +103,44 @@ describe('Fix 4: configurable prune thresholds', () => {
         assert.strictEqual(ops2.operations.length, 0);
     });
 
+    it('uses expirePruneTsMs before node expiry timestamp', async () => {
+        const momentSize = 1000;
+        const createdOnTimestamp = 900_000;
+        const nomad = buildNomad({ expirePruneTsMs: 5000 }, [{
+            ...defaultClusterNode('expiring_prune_pubkey'),
+            isUnl: true,
+            lifeMoments: 1,
+            maxLifeMoments: 1,
+            createdOnTimestamp,
+            status: { status: 1, onLcl: 100 },
+            activeOnLcl: 200,
+        }]);
+        nomad.clusterContext.evernodeContext.getEvernodeConfig = () => ({ momentSize });
+        const expiryTs = createdOnTimestamp + momentSize * 1000;
+        nomad.clusterContext.hpContext.timestamp = expiryTs - 4000;
+        await nomad.prune();
+        await nomad.clusterContext.deinit();
+        let ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.strictEqual(ops.operations.length, 1);
+        assert.strictEqual(ops.operations[0].ref, 'expiring_prune_pubkey');
+
+        const nomad2 = buildNomad({ expirePruneTsMs: 5000 }, [{
+            ...defaultClusterNode('expiring_prune_pubkey'),
+            isUnl: true,
+            lifeMoments: 1,
+            maxLifeMoments: 1,
+            createdOnTimestamp,
+            status: { status: 1, onLcl: 100 },
+            activeOnLcl: 200,
+        }]);
+        nomad2.clusterContext.evernodeContext.getEvernodeConfig = () => ({ momentSize });
+        nomad2.clusterContext.hpContext.timestamp = expiryTs - 6000;
+        await nomad2.prune();
+        await nomad2.clusterContext.deinit();
+        ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.strictEqual(ops.operations.length, 0);
+    });
+
     it('uses custom immaturePruneLcl for non-UNL CREATED nodes', async () => {
         const nomad = buildNomad({ immaturePruneLcl: 5 }, [{
             ...defaultClusterNode(IMMATURE_PUBKEY),

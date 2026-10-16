@@ -5,7 +5,7 @@ const fs = require('fs');
 const { OperationType } = require('../../dist/models/cluster');
 const NomadContext = require('../../dist/context/NomadContext').default;
 const { createWorkDir } = require('./test-workdir');
-const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, buildClusterContext } = require('./cluster-test-helpers');
+const { writeAcquiresFile, writeClusterFiles, defaultClusterNode, buildClusterContext, consensusContract } = require('./cluster-test-helpers');
 
 const SIGNER_A = 'signer_remove_a_pubkey';
 const SIGNER_B = 'signer_remove_b_pubkey';
@@ -95,8 +95,15 @@ describe('Fix 2: parallel ops per round', () => {
         assert.ok(ops.operations.every((o) => o.type === OperationType.ADD_NODE));
     });
 
+    it('rejects maxOpsPerRound below 1', () => {
+        assert.throws(() => {
+            buildClusterContext({}, {}, { maxOpsPerRound: 0 });
+        }, /maxOpsPerRound must be at least 1/);
+    });
+
     it('runs at most one signer-touching REMOVE per init round', async () => {
         let replaceCalls = 0;
+        const unlRemovalAttempts = [];
         const signerList = {
             signerQuorum: 2,
             signerList: [
@@ -116,6 +123,7 @@ describe('Fix 2: parallel ops per round', () => {
                 { type: OperationType.REMOVE_NODE, ref: SIGNER_B, data: { nodePubkey: SIGNER_B, force: true } },
             ],
         });
+        const { hpOverrides } = consensusContract(['helper', SIGNER_A, SIGNER_B]);
         const ctx = buildClusterContext({
             getIfAcquired: () => null,
             getIfPending: () => false,
@@ -125,10 +133,16 @@ describe('Fix 2: parallel ops per round', () => {
                 { publicKey: SIGNER_A },
                 { publicKey: SIGNER_B },
             ],
-            getContractConfig: async () => ({
-                unl: ['helper', SIGNER_A, SIGNER_B],
-                consensus: { roundtime: 1000, stage_slice: 100 },
-            }),
+            ...hpOverrides,
+            updateContractConfig: async (config) => {
+                const before = await hpOverrides.getContractConfig();
+                before.unl.forEach((p) => {
+                    if (!config.unl.includes(p)) {
+                        unlRemovalAttempts.push(p);
+                    }
+                });
+                return hpOverrides.updateContractConfig(config);
+            },
         }, { maxOpsPerRound: 3 });
 
         ctx.evernodeContext.xrplContext.getSignerList = () => signerList;
@@ -151,7 +165,9 @@ describe('Fix 2: parallel ops per round', () => {
         await ctx.init();
         await ctx.deinit();
         assert.strictEqual(replaceCalls, 1);
+        assert.deepStrictEqual(unlRemovalAttempts, [SIGNER_A]);
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
+        assert.strictEqual(ops.operations[0].ref, SIGNER_B);
     });
 });
