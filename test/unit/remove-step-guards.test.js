@@ -24,6 +24,36 @@ describe('REMOVE step guards (N5–N7)', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
+    it('N4: signer REMOVE still runs when the ledger signer list no longer contains the address', async () => {
+        let replaceCalls = 0;
+        const signerList = { signerQuorum: 1, signerList: [] };
+        writeClusterFiles({
+            nodes: [
+                { ...defaultClusterNode('helper_pubkey'), isUnl: true },
+                { ...defaultClusterNode(TARGET), isUnl: true, signerAddress: SIGNER },
+            ],
+            pendingNodes: [],
+            operations: [{ type: 'remove_node', ref: TARGET, data: { nodePubkey: TARGET, force: true } }],
+        });
+        const ctx = buildClusterContext({}, {
+            getContractUnl: () => [{ publicKey: 'helper_pubkey' }, { publicKey: TARGET }],
+            getContractConfig: async () => ({ unl: ['helper_pubkey', TARGET], consensus: { roundtime: 1000, stage_slice: 100 } }),
+        });
+        ctx.evernodeContext.xrplContext.getSignerList = () => signerList;
+        ctx.evernodeContext.xrplContext.replaceSignerList = async () => { replaceCalls++; };
+        ctx.evernodeContext.xrplContext.multiSigner = {
+            isSignerNode: () => false,
+            getSigner: () => null,
+            generateSigner: () => ({ account: 'rNew' }),
+        };
+        ctx.evernodeContext.xrplContext.getTransactionSubmissionInfo = async () => ({
+            options: { key: 'helper_pubkey', options: { signerAddress: 'rNew' } },
+        });
+        await ctx.init();
+        await ctx.deinit();
+        assert.ok(replaceCalls >= 1);
+    });
+
     it('N5: replaceSignerList no-ops when the old signer is already absent', async () => {
         let replaceCalls = 0;
         const signerList = { signerQuorum: 1, signerList: [{ account: 'rOther', weight: 1 }] };
@@ -37,7 +67,10 @@ describe('REMOVE step guards (N5–N7)', () => {
             getContractConfig: async () => ({ unl: [TARGET], consensus: { roundtime: 1000, stage_slice: 100 } }),
         });
         ctx.evernodeContext.xrplContext.getSignerList = () => signerList;
-        ctx.evernodeContext.xrplContext.replaceSignerList = async () => { replaceCalls++; };
+        ctx.evernodeContext.xrplContext.replaceSignerList = async (oldSigner) => {
+            if (signerList.signerList.some((s) => s.account === oldSigner))
+                replaceCalls++;
+        };
         ctx.evernodeContext.xrplContext.multiSigner = { isSignerNode: () => false, getSigner: () => null };
         await ctx.init();
         await ctx.deinit();

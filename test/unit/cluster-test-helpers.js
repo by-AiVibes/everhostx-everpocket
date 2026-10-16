@@ -73,7 +73,7 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
         init: async () => {},
         deinit: async () => {},
         getIfAcquired: () => null,
-        getIfPending: () => true,
+        getIfPending: () => false,
         acquireNode: async () => { throw new Error('acquire should not run'); },
         extendSubmit: async () => false,
         xrplContext: { multiSigner: { isSignerNode: () => false, getSigner: () => null } },
@@ -90,8 +90,38 @@ async function runClusterRound(evernodeOverrides, hpOverrides) {
     await ctx.deinit();
 }
 
+/**
+ * Simulates Evernode pending/acquired lookups keyed by transaction hash refId.
+ */
+function createAcquireTxHarness() {
+    const pendingTxHashes = new Set();
+    const acquiredByTx = new Map();
+    let txSeq = 0;
+
+    const evernodeOverrides = {
+        acquireNode: async () => {
+            const refId = `0xacquire_tx_${++txSeq}`;
+            pendingTxHashes.add(refId);
+            return { refId, host: 'host.example' };
+        },
+        getIfPending: (refId) => pendingTxHashes.has(refId),
+        getIfAcquired: (refId) => acquiredByTx.get(refId) ?? null,
+    };
+
+    return {
+        evernodeOverrides,
+        pendingTxHashes,
+        acquiredByTx,
+        markAcquired(refId, info) {
+            pendingTxHashes.delete(refId);
+            acquiredByTx.set(refId, info);
+        },
+    };
+}
+
 module.exports = {
     consensusContract,
+    createAcquireTxHarness,
     writeAcquiresFile,
     writeClusterFiles,
     defaultClusterNode,

@@ -35,7 +35,7 @@ function buildNode(workDir, nodeId, { throwOnAttempt }, hpBase) {
     process.chdir(workDir);
     const ctx = buildClusterContext({
         getIfAcquired: () => null,
-        getIfPending: () => true,
+        getIfPending: (refId) => refId === PENDING_REF,
         voteContext: {
             getUniqueNumber: () => 0,
             vote: async () => {

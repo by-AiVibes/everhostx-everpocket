@@ -48,7 +48,7 @@ describe('Fix 1: re-queue failed operations with retry metadata', () => {
 
         const ctx = buildClusterContext({
             getIfAcquired: () => null,
-            getIfPending: () => true,
+            getIfPending: (refId) => refId === PENDING_REF,
         }, consensusContract([DEAD_PUBKEY]).hpOverrides);
         await ctx.init();
         await ctx.deinit();

@@ -87,7 +87,7 @@ describe('Operation agreed-state guards (behavioral)', () => {
     it('does not treat ADD as complete when only a different pending acquire exists', async () => {
         writeClusterFiles({
             nodes: [],
-            pendingNodes: [{ refId: OTHER_PENDING_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
+            pendingNodes: [{ refId: '0xtx_other', opRef: OTHER_PENDING_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
             operations: [{
                 type: OperationType.ADD_NODE,
                 ref: ADD_REF,
@@ -98,8 +98,9 @@ describe('Operation agreed-state guards (behavioral)', () => {
         const ctx = buildClusterContext({
             acquireNode: async () => {
                 acquired = true;
-                return { refId: 'ignored', host: 'h' };
+                return { refId: '0xtx_new_add', host: 'h' };
             },
+            getIfPending: (refId) => refId === '0xtx_other',
         });
         await ctx.init();
         await ctx.deinit();
@@ -107,14 +108,14 @@ describe('Operation agreed-state guards (behavioral)', () => {
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
         const pending = JSON.parse(fs.readFileSync('cluster.json', 'utf8')).pendingNodes;
-        assert.ok(pending.some((p) => p.refId === ADD_REF));
-        assert.ok(pending.some((p) => p.refId === OTHER_PENDING_REF));
+        assert.ok(pending.some((p) => p.opRef === ADD_REF));
+        assert.ok(pending.some((p) => p.opRef === OTHER_PENDING_REF));
     });
 
     it('dequeues ADD when this op pending acquire was already in agreed state at round start', async () => {
         writeClusterFiles({
             nodes: [],
-            pendingNodes: [{ refId: ADD_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
+            pendingNodes: [{ refId: '0xtx_add', opRef: ADD_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
             operations: [{
                 type: OperationType.ADD_NODE,
                 ref: ADD_REF,
@@ -131,6 +132,36 @@ describe('Operation agreed-state guards (behavioral)', () => {
         await ctx.init();
         await ctx.deinit();
         assert.strictEqual(acquireCalls, 0);
+        const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
+        assert.strictEqual(ops.operations.length, 0);
+    });
+
+    it('removes cluster zombie when REMOVE is dropped after partial UNL drop', async () => {
+        const MAX_OPERATION_RETRY_ATTEMPTS = 32;
+        const { hpOverrides } = consensusContract([]);
+        writeClusterFiles({
+            nodes: [{ ...defaultClusterNode(REMOVE_PUBKEY), isUnl: true, domain: 'z.example', peerPort: 11 }],
+            pendingNodes: [],
+            operations: [{
+                type: OperationType.REMOVE_NODE,
+                ref: REMOVE_PUBKEY,
+                data: { nodePubkey: REMOVE_PUBKEY, force: true },
+                retryCount: MAX_OPERATION_RETRY_ATTEMPTS - 1,
+            }],
+        });
+        const ctx = buildClusterContext({
+            getIfAcquired: () => null,
+            getIfPending: () => false,
+        }, {
+            ...hpOverrides,
+            updatePeers: async () => {
+                throw new Error('peer update failed');
+            },
+        });
+        await ctx.init();
+        await ctx.deinit();
+        const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
+        assert.ok(!cluster.nodes.some((n) => n.pubkey === REMOVE_PUBKEY));
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 0);
     });
@@ -208,7 +239,7 @@ describe('Multi-node agreed snapshots', () => {
                     return hpOverrides.updateContractConfig(cfg);
                 },
                 updatePeers: async () => {
-                    if (!failConfig) throw new Error('peer update fail');
+                    throw new Error('peer update fail');
                 },
             });
             await ctx.init();
@@ -217,7 +248,7 @@ describe('Multi-node agreed snapshots', () => {
         }
 
         await runNode(dirs[0], true);
-        await runNode(dirs[1], false);
+        await runNode(dirs[1], true);
 
         const opsA = fs.readFileSync(path.join(dirs[0], 'operations.json'), 'utf8');
         const opsB = fs.readFileSync(path.join(dirs[1], 'operations.json'), 'utf8');

@@ -25,7 +25,8 @@ const TIMEOUT = 10000;
 type RoundAgreedState = {
     unl: string[];
     clusterNodePubkeys: Set<string>;
-    pendingAcquireRefIds: Set<string>;
+    pendingAddOpRefs: Set<string>;
+    clusterAddOpRefs: Set<string>;
     nodeLifeMoments: Map<string, number>;
     nodeTargetLifeMoments: Map<string, number>;
     ledgerSignerAccounts: Set<string>;
@@ -73,6 +74,7 @@ class ClusterContext {
         await this.evernodeContext.init();
 
         try {
+            const roundState = await this.#captureRoundAgreedState();
             await this.#setupClusterInfo();
             await this.#updateActiveness();
             const aliveCheckReached = await this.#checkForPendingNodes();
@@ -81,7 +83,7 @@ class ClusterContext {
             await this.#checkForExtends();
             // Defer only new ADD operations while a pending-node aliveness probe ran this round.
             // REMOVE and EXTEND must still run so heal is not blocked by in-flight acquires.
-            await this.#processOperations(aliveCheckReached);
+            await this.#processOperations(aliveCheckReached, roundState);
             this.initialized = true;
         } catch (e) {
             await this.deinit();
@@ -173,7 +175,8 @@ class ClusterContext {
         return {
             unl: [...config.unl],
             clusterNodePubkeys: new Set(nodes.map((n) => n.pubkey)),
-            pendingAcquireRefIds: new Set(this.getPendingNodes().map((p) => p.refId)),
+            pendingAddOpRefs: new Set(this.getPendingNodes().map((p) => p.opRef).filter((r): r is string => !!r)),
+            clusterAddOpRefs: new Set(nodes.map((n) => n.addOpRef).filter((r): r is string => !!r)),
             nodeLifeMoments: new Map(nodes.map((n) => [n.pubkey, n.lifeMoments])),
             nodeTargetLifeMoments: new Map(nodes.map((n) => [n.pubkey, n.targetLifeMoments])),
             ledgerSignerAccounts,
@@ -186,7 +189,8 @@ class ClusterContext {
             return !roundState.unl.includes(pubkey) && !roundState.clusterNodePubkeys.has(pubkey);
         }
         if (operation.type === OperationType.ADD_NODE) {
-            return roundState.pendingAcquireRefIds.has(operation.ref);
+            return roundState.pendingAddOpRefs.has(operation.ref)
+                || roundState.clusterAddOpRefs.has(operation.ref);
         }
         if (operation.type === OperationType.EXTEND_NODE) {
             const data = operation.data as ExtendNodeOperation;
@@ -197,11 +201,15 @@ class ClusterContext {
         return false;
     }
 
-    #advanceOperationRetrySchedule(operation: Operation, operationIndex: number, curLcl: number): void {
+    async #advanceOperationRetrySchedule(operation: Operation, operationIndex: number, curLcl: number): Promise<void> {
         const retryCount = (operation.retryCount || 0) + 1;
         operation.retryCount = retryCount;
         if (retryCount >= MAX_OPERATION_RETRY_ATTEMPTS) {
             error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_RETRY_ATTEMPTS} failed attempts.`);
+            if (operation.type === OperationType.REMOVE_NODE) {
+                const pubkey = (operation.data as RemoveNodeOperation).nodePubkey;
+                await this.#reconcileRemoveZombieFromConsensusUnl(pubkey);
+            }
             this.operationData.operations.splice(operationIndex, 1);
         } else {
             const backoffLcl = Math.min(2 ** retryCount, 32);
@@ -217,7 +225,7 @@ class ClusterContext {
 
                 log(`Acquiring a new node...`);
                 let acquire = (await this.evernodeContext.acquireNode(data.acquireOptions)) as PendingNode;
-                acquire.refId = operation.ref;
+                acquire.opRef = operation.ref;
                 acquire.targetLifeMoments = data.lifeMoments;
                 acquire.maxLifeMoments = data.maxLifeMoments;
                 acquire.aliveCheckCount = 0;
@@ -248,7 +256,7 @@ class ClusterContext {
 
                 log(`Removing the node ${pubkey}...`);
 
-                if (node?.signerAddress && roundState.ledgerSignerAccounts.has(node.signerAddress)) {
+                if (node?.signerAddress) {
                     const nonQuorumNodes = this.getClusterUnlNodes().filter(n => !n.signerAddress);
 
                     if (nonQuorumNodes.length > 0 && (node?.signerReplaceFailedAttempts || 0) < MAX_SIGNER_REPLACE_ATTEMPTS) {
@@ -271,6 +279,7 @@ class ClusterContext {
                             try {
                                 await this.evernodeContext.xrplContext.replaceSignerList(node.signerAddress, newSignerAddress, { txSubmitInfo: txSubmitInfo });
                                 this.clusterManager.markAsQuorum(newSignerPubkey, newSignerAddress);
+                                this.clusterManager.clearSignerAddress(pubkey);
 
                                 // Set new signer if new signer is self.
                                 if (newSignerPubkey === this.hpContext.publicKey && newSignerKey)
@@ -302,6 +311,7 @@ class ClusterContext {
                         const newSignerNode = quorumNodes[randomIndex];
                         try {
                             await this.evernodeContext.xrplContext.replaceSignerList(node.signerAddress, newSignerNode.signerAddress!);
+                            this.clusterManager.clearSignerAddress(pubkey);
                         }
                         catch (e) {
                             if ((node?.signerReplaceFailedAttempts || 0) >= MAX_SIGNER_REPLACE_ATTEMPTS)
@@ -329,24 +339,37 @@ class ClusterContext {
                 // Update peer list.
                 const clusterNode = this.clusterManager.getNode(pubkey);
                 if (clusterNode) {
+                    let peerError: unknown;
                     if (clusterNode?.domain && clusterNode?.peerPort) {
-                        let peer = `${clusterNode?.domain}:${clusterNode?.peerPort}`
-                        await this.hpContext.updatePeers(null, [peer]);
+                        const peer = `${clusterNode.domain}:${clusterNode.peerPort}`;
+                        try {
+                            await this.hpContext.updatePeers(null, [peer]);
+                        } catch (e) {
+                            peerError = e;
+                            error(e);
+                        }
                     }
 
                     this.clusterManager.removeNode(pubkey);
+                    if (peerError)
+                        throw peerError;
                 }
             }
+    }
+
+    async #reconcileRemoveZombieFromConsensusUnl(pubkey: string): Promise<void> {
+        const config = await this.hpContext.getContractConfig();
+        if (config.unl.findIndex((p: string) => p === pubkey) === -1 && this.clusterManager.getNode(pubkey))
+            this.clusterManager.removeNode(pubkey);
     }
 
     /**
      * Process operations one by one at each execution.
      */
-    async #processOperations(deferAdd: boolean = false) {
+    async #processOperations(deferAdd: boolean = false, roundState: RoundAgreedState) {
         if (this.operationData.operations.length === 0)
             return;
 
-        const roundState = await this.#captureRoundAgreedState();
         const curLcl = this.hpContext.lclSeqNo;
         const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl);
         if (operationIndex < 0)
@@ -366,7 +389,7 @@ class ClusterContext {
             } catch (e) {
                 error(e);
             }
-            this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
+            await this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
         }
 
         info(`Operations processor ended.`);
@@ -448,6 +471,7 @@ class ClusterContext {
 
                         this.clusterManager.addNode(<ClusterNode>{
                             refId: node.refId,
+                            addOpRef: node.opRef,
                             contractId: info.contractId,
                             status: {
                                 status: NodeStatus.CREATED,

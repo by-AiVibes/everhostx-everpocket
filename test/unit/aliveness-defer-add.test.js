@@ -60,7 +60,7 @@ describe('Fix 5: pending aliveness defers ADD only', () => {
                     outboundIp: '1.2.3.4',
                 };
             },
-            getIfPending: () => true,
+            getIfPending: (refId) => refId === PENDING_REF,
             acquireNode: async () => {
                 throw new Error('ADD must be deferred during aliveness check');
             },

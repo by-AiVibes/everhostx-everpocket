@@ -48,7 +48,7 @@ describe('Operation retry guards (regression)', () => {
         const { hpOverrides } = consensusContract([BLOCKED_PUBKEY]);
         const ctx = buildClusterContext({
             getIfAcquired: () => null,
-            getIfPending: () => true,
+            getIfPending: (refId) => refId === PENDING_REF,
         }, { lclSeqNo: 500, ...hpOverrides });
 
         await ctx.init();
@@ -73,7 +73,7 @@ describe('Operation retry guards (regression)', () => {
         const { hpOverrides } = consensusContract([BLOCKED_PUBKEY]);
         const ctx = buildClusterContext({
             getIfAcquired: () => null,
-            getIfPending: () => true,
+            getIfPending: (refId) => refId === PENDING_REF,
         }, { lclSeqNo: curLcl, ...hpOverrides });
 
         await ctx.init();
@@ -139,7 +139,7 @@ describe('Operation retry guards (regression)', () => {
         const { hpOverrides } = consensusContract([BLOCKED_PUBKEY]);
         const ctx1 = buildClusterContext({
             getIfAcquired: () => null,
-            getIfPending: () => true,
+            getIfPending: (refId) => refId === PENDING_REF,
         }, { lclSeqNo: curLcl, ...hpOverrides });
         await ctx1.init();
         await ctx1.deinit();

@@ -261,6 +261,14 @@ class ClusterManager {
      * @param pubkey Public key of the node.
      * @param signerAddress Signer address of the node.
      */
+    public clearSignerAddress(pubkey: string): void {
+        const index = this.clusterData.nodes.findIndex(n => n.pubkey === pubkey);
+        if (index >= 0 && this.clusterData.nodes[index].signerAddress) {
+            delete this.clusterData.nodes[index].signerAddress;
+            this.updated = true;
+        }
+    }
+
     public markAsQuorum(pubkey: string, signerAddress: string): void {
         const index = this.clusterData.nodes.findIndex(n => n.pubkey === pubkey);
 

@@ -20,6 +20,8 @@ export interface ClusterNode extends AcquiredNode {
   status: NodeStatusInfo;
   activeOnLcl?: number;
   isUnl: boolean;
+  /** ADD operation ref when this node was promoted from a pending acquire. */
+  addOpRef?: string;
   signerAddress?: string;
   createdOnTimestamp?: number;
   lifeMoments: number;
@@ -33,6 +35,8 @@ export interface PendingNode extends PendingAcquire {
   targetLifeMoments: number;
   maxLifeMoments?: number;
   aliveCheckCount: number;
+  /** Operation queue ref for the ADD that created this pending acquire. */
+  opRef?: string;
 }
 
 export interface ClusterData {
