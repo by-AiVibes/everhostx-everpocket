@@ -159,28 +159,24 @@ class ClusterContext {
         return !!signerList?.signerList?.some(s => s.account === signerAddress);
     }
 
-    #majorityReportedSuccess(votes: { data?: { success?: boolean } }[]): boolean {
-        if (!votes?.length)
-            return false;
-        const successCount = votes.filter(v => v?.data?.success === true).length;
-        return successCount > votes.length / 2;
-    }
-
-    async #voteAgreedOperationSuccess(operation: Operation, curLcl: number, localSuccess: boolean): Promise<boolean> {
-        const electionName = `operation_outcome_${operation.ref}_${operation.type}_${curLcl}_${operation.retryCount ?? 0}`;
-        const unlCount = this.hpContext.getContractUnl().length;
-        const elector = new AllVoteElector(unlCount, TIMEOUT);
-        const votes = await this.voteContext.vote(electionName, [{ success: localSuccess }], elector);
-        return this.#majorityReportedSuccess(votes);
-    }
-
-    #applyQueuedOperationOutcome(operation: Operation, operationIndex: number, agreedSuccess: boolean, curLcl: number): void {
-        if (agreedSuccess) {
-            this.operationData.operations.splice(operationIndex, 1);
-            this.updatedData = true;
-            return;
+    async #isOperationCompleteInAgreedState(operation: Operation): Promise<boolean> {
+        if (operation.type === OperationType.REMOVE_NODE) {
+            const pubkey = (operation.data as RemoveNodeOperation).nodePubkey;
+            const config = await this.hpContext.getContractConfig();
+            return config.unl.findIndex((p: string) => p === pubkey) === -1;
         }
+        if (operation.type === OperationType.ADD_NODE) {
+            return this.getPendingNodes().length > 0;
+        }
+        if (operation.type === OperationType.EXTEND_NODE) {
+            const data = operation.data as ExtendNodeOperation;
+            const node = this.clusterManager.getNode(data.nodePubkey);
+            return !!node && node.lifeMoments >= node.targetLifeMoments;
+        }
+        return false;
+    }
 
+    #advanceOperationRetrySchedule(operation: Operation, operationIndex: number, curLcl: number): void {
         const retryCount = (operation.retryCount || 0) + 1;
         operation.retryCount = retryCount;
         if (retryCount >= MAX_OPERATION_RETRY_ATTEMPTS) {
@@ -192,6 +188,7 @@ class ClusterContext {
         }
         this.updatedData = true;
     }
+
 
     async #performOperation(operation: Operation): Promise<void> {
             if (operation.type === OperationType.ADD_NODE) {
@@ -296,12 +293,15 @@ class ClusterContext {
                     }
                 }
 
-                // Update patch config if node exists in UNL.
-                let config = await this.hpContext.getContractConfig();
+                // Update patch config if node exists in UNL (do not mutate agreed config in place).
+                const config = await this.hpContext.getContractConfig();
                 const idx = config.unl.findIndex((p: string) => p === pubkey);
                 if (idx > -1) {
-                    config.unl.splice(idx, 1);
-                    await this.hpContext.updateContractConfig(config);
+                    const updatedConfig = {
+                        ...config,
+                        unl: config.unl.filter((p: string) => p !== pubkey),
+                    };
+                    await this.hpContext.updateContractConfig(updatedConfig);
                 }
 
                 // Update peer list.
@@ -333,16 +333,18 @@ class ClusterContext {
 
         info(`Operations processor started.`);
 
-        let localSuccess = false;
         try {
             await this.#performOperation(operation);
-            localSuccess = true;
         } catch (e) {
             error(e);
         }
 
-        const agreedSuccess = await this.#voteAgreedOperationSuccess(operation, curLcl, localSuccess);
-        this.#applyQueuedOperationOutcome(operation, operationIndex, agreedSuccess, curLcl);
+        if (await this.#isOperationCompleteInAgreedState(operation)) {
+            this.operationData.operations.splice(operationIndex, 1);
+            this.updatedData = true;
+        } else {
+            this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
+        }
 
         info(`Operations processor ended.`);
     }

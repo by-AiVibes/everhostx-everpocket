@@ -8,6 +8,7 @@ const {
     writeClusterFiles,
     defaultClusterNode,
     buildClusterContext,
+    consensusContract,
 } = require('./cluster-test-helpers');
 
 const BLOCKED_PUBKEY = 'blocked_remove_pubkey';
@@ -44,10 +45,11 @@ describe('Operation retry guards (regression)', () => {
             }],
         });
 
+        const { hpOverrides } = consensusContract([BLOCKED_PUBKEY]);
         const ctx = buildClusterContext({
             getIfAcquired: () => null,
             getIfPending: () => true,
-        }, { lclSeqNo: 500 });
+        }, { lclSeqNo: 500, ...hpOverrides });
 
         await ctx.init();
         await ctx.deinit();
@@ -68,10 +70,11 @@ describe('Operation retry guards (regression)', () => {
             }],
         });
 
+        const { hpOverrides } = consensusContract([BLOCKED_PUBKEY]);
         const ctx = buildClusterContext({
             getIfAcquired: () => null,
             getIfPending: () => true,
-        }, { lclSeqNo: curLcl });
+        }, { lclSeqNo: curLcl, ...hpOverrides });
 
         await ctx.init();
         await ctx.deinit();
@@ -105,7 +108,8 @@ describe('Operation retry guards (regression)', () => {
             ],
         });
 
-        const ctx = buildClusterContext({}, { lclSeqNo: 100 });
+        const { hpOverrides } = consensusContract([BLOCKED_PUBKEY, READY_PUBKEY]);
+        const ctx = buildClusterContext({}, { lclSeqNo: 100, ...hpOverrides });
         await ctx.init();
         await ctx.deinit();
 
@@ -130,10 +134,11 @@ describe('Operation retry guards (regression)', () => {
             }],
         });
 
+        const { hpOverrides } = consensusContract([BLOCKED_PUBKEY]);
         const ctx1 = buildClusterContext({
             getIfAcquired: () => null,
             getIfPending: () => true,
-        }, { lclSeqNo: curLcl });
+        }, { lclSeqNo: curLcl, ...hpOverrides });
         await ctx1.init();
         await ctx1.deinit();
 
@@ -148,7 +153,7 @@ describe('Operation retry guards (regression)', () => {
             operations: ops.operations,
         });
 
-        const ctx2 = buildClusterContext({}, { lclSeqNo: nextRetryLcl });
+        const ctx2 = buildClusterContext({}, { lclSeqNo: nextRetryLcl, ...hpOverrides });
         await ctx2.init();
         await ctx2.deinit();
 

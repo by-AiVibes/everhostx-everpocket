@@ -8,6 +8,7 @@ const {
     writeClusterFiles,
     defaultClusterNode,
     buildClusterContext,
+    consensusContract,
 } = require('./cluster-test-helpers');
 
 const DEAD_PUBKEY = 'dead_node_pubkey_for_remove_test';
@@ -48,7 +49,7 @@ describe('Fix 1: re-queue failed operations with retry metadata', () => {
         const ctx = buildClusterContext({
             getIfAcquired: () => null,
             getIfPending: () => true,
-        });
+        }, consensusContract([DEAD_PUBKEY]).hpOverrides);
         await ctx.init();
         await ctx.deinit();
 
@@ -73,7 +74,7 @@ describe('Fix 1: re-queue failed operations with retry metadata', () => {
             nodes: [defaultClusterNode(DEAD_PUBKEY)],
         });
 
-        const ctx = buildClusterContext();
+        const ctx = buildClusterContext({}, consensusContract([DEAD_PUBKEY]).hpOverrides);
         await ctx.init();
         await ctx.deinit();
 

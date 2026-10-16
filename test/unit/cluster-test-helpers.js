@@ -2,6 +2,23 @@ const fs = require('fs');
 
 const { ClusterContext } = require('../../dist');
 
+function consensusContract(unlPubkeys = []) {
+    const state = {
+        unl: [...unlPubkeys],
+        consensus: { roundtime: 1000, stage_slice: 100 },
+    };
+    return {
+        state,
+        hpOverrides: {
+            getContractConfig: async () => state,
+            updateContractConfig: async (cfg) => {
+                state.unl = [...cfg.unl];
+                return state;
+            },
+        },
+    };
+}
+
 function writeAcquiresFile() {
     fs.writeFileSync('acquires.json', JSON.stringify({ acquiredNodes: [], pendingAcquires: [] }));
 }
@@ -74,6 +91,7 @@ async function runClusterRound(evernodeOverrides, hpOverrides) {
 }
 
 module.exports = {
+    consensusContract,
     writeAcquiresFile,
     writeClusterFiles,
     defaultClusterNode,

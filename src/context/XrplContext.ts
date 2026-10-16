@@ -569,18 +569,17 @@ class XrplContext {
      * @returns New signer address.
      */
     async replaceSignerList(oldSignerAddress: string, newSignerAddress: string, options: MultiSignOptions = {}): Promise<void> {
-        // Replace signer from the list and renew the signer list. Clone objet to avoid reference.
-        let signerListInfo = <SignerListInfo>{};
-        if (this.signerListInfo)
-            Object.assign(signerListInfo, this.signerListInfo);
-
-        if (!signerListInfo?.signerList)
+        if (!this.signerListInfo?.signerList)
             throw `Current signer list does not exist.`
 
-        // Remove signer from the list and renew the signer list.
-        const oldSignerIndex = signerListInfo.signerList.findIndex(s => s.account === oldSignerAddress);
+        const oldSignerIndex = this.signerListInfo.signerList.findIndex(s => s.account === oldSignerAddress);
         if (oldSignerIndex === -1)
             return;
+
+        const signerListInfo: SignerListInfo = {
+            signerQuorum: this.signerListInfo.signerQuorum,
+            signerList: this.signerListInfo.signerList.map(s => ({ account: s.account, weight: s.weight })),
+        };
 
         const newSignerIndex = signerListInfo.signerList.findIndex(s => s.account === newSignerAddress);
 
