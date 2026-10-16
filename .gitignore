@@ -2,6 +2,7 @@ node_modules
 test/.work/
 test/cluster.json
 test/operations.json
+test/transactions.json
 **/dist/**
 !hp.cfg.override
-!streamer.configtest/transactions.json
+!streamer.config
