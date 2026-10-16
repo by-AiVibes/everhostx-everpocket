@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { FrozenRoundSnapshot } from './RoundSnapshot';
 import { ExtendNodeOperation, Operation, OperationData } from '../models/cluster';
+import { getPinnedExtendTx, hashExtendCanonical } from './ExtendPinning';
 
 /** LastLedgerSequence window above agreed anchor ledger. */
 export const LLS_LEDGER_WINDOW = 30;
@@ -23,25 +24,6 @@ export function readFeeCeiling(snap: FrozenRoundSnapshot): string {
 
 export function readTenantSequence(snap: FrozenRoundSnapshot): number {
     return snap.tenantSequence;
-}
-
-/**
- * Quorum-agreed tenant sequence advanced past the frozen round snapshot means the snapshot
- * sequence is consumed. All nodes apply this the same way (no local ledger reads).
- */
-export function syncConsumedTenantSequenceFromQuorum(
-    operationData: OperationData,
-    snapshot: FrozenRoundSnapshot,
-): boolean {
-    const snapSeq = readTenantSequence(snapshot);
-    const agreed = operationData.agreedTenantSequence;
-    if (agreed === undefined || agreed <= snapSeq)
-        return false;
-    if (!operationData.consumedTenantSequences)
-        operationData.consumedTenantSequences = [];
-    if (!operationData.consumedTenantSequences.includes(snapSeq))
-        operationData.consumedTenantSequences.push(snapSeq);
-    return true;
 }
 
 export function pickHostForOpRef(snap: FrozenRoundSnapshot, opRef: string): string {
@@ -91,11 +73,25 @@ export function extendTxCanonicalFields(
     };
 }
 
-export function computeExtendTxHash(snap: FrozenRoundSnapshot, operation: Operation): string {
-    const canonical = extendTxCanonicalFields(snap, operation);
-    const keys = Object.keys(canonical).sort();
-    const ordered: Record<string, string | number> = {};
-    for (const k of keys)
-        ordered[k] = canonical[k];
-    return `0x${createHash('sha256').update(JSON.stringify(ordered)).digest('hex')}`;
+export function computeExtendTxHash(
+    snap: FrozenRoundSnapshot,
+    operation: Operation,
+    operationData?: OperationData,
+): string {
+    const pin = operationData ? getPinnedExtendTx(operationData, operation.ref) : undefined;
+    if (pin)
+        return pin.txHash;
+    return hashExtendCanonical(extendTxCanonicalFields(snap, operation));
+}
+
+export function txSubmitInfoFromPinnedExtend(pin: {
+    sequence: number;
+    lastLedgerSequence: number;
+    fee: string;
+}): { sequence: number; maxLedgerSequence: number; fee: string } {
+    return {
+        sequence: pin.sequence,
+        maxLedgerSequence: pin.lastLedgerSequence,
+        fee: pin.fee,
+    };
 }

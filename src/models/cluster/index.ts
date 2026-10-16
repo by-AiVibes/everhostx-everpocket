@@ -78,6 +78,8 @@ export interface Operation {
   attempt?: number;
   nextAttemptLcl?: number;
   createdLcl?: number;
+  /** Set when quorum shows the pinned sequence consumed by a different tx. */
+  extendHoldReason?: string;
   /** @deprecated migrated to attempt */
   retryCount?: number;
   /** @deprecated migrated to nextAttemptLcl */
@@ -96,6 +98,15 @@ export interface OperationData {
   observationDedup?: Record<string, { nonce: number; observedLcl: number }>;
   /** Tenant sequences for which a quorum-confirmed extend already landed; never resubmit at these. */
   consumedTenantSequences?: number[];
+  /** Agreed extend tx fields pinned on first attempt (hash stable across retries). */
+  pinnedExtendTxs?: Record<string, {
+    sequence: number;
+    lastLedgerSequence: number;
+    fee: string;
+    host: string;
+    txHash: string;
+    anchorLedger: number;
+  }>;
 }
 
 export enum ClusterMessageType {

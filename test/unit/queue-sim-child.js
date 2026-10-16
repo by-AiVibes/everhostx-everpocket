@@ -70,21 +70,22 @@ async function main() {
     const ctx = buildClusterContext({
         finishRoundInit: async () => {},
         extendSubmit: async (_host, _moments, _name, options) => {
+            const ref = options?.extendOpRef ?? EXTEND_PUBKEY;
             const liveOps = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
-            if (liveOps.agreedExtendResults?.[EXTEND_PUBKEY]?.resultCode === 'tesSUCCESS')
-                return { hash: liveOps.agreedExtendResults[EXTEND_PUBKEY].hash };
-            const seq = options?.txSubmitInfo?.sequence ?? DEFAULT_TENANT_SEQUENCE;
+            const pin = liveOps.pinnedExtendTxs?.[ref];
+            const seq = options?.txSubmitInfo?.sequence ?? pin?.sequence ?? DEFAULT_TENANT_SEQUENCE;
             if (liveOps.consumedTenantSequences?.includes(seq))
                 return false;
             if (shouldFailSubmit(seed, Number(nodeId.replace('n', '')), round))
                 throw new Error(`sim extend fail ${nodeId} r${round}`);
-            const hash = ledgerApi.realTxHash(seed, round, nodeId, seq, EXTEND_PUBKEY);
-            const cap = buildLastLedgerSequence(anchor);
+            const lls = options?.txSubmitInfo?.maxLedgerSequence ?? pin?.lastLedgerSequence ?? buildLastLedgerSequence(anchor);
+            const hash = options?.pinnedExtendTxHash ?? pin?.txHash ?? ledgerApi.realTxHash(seed, round, nodeId, seq, ref);
             ledgerApi.recordSubmitIntent({
-                ref: EXTEND_PUBKEY,
+                ref,
                 hash,
-                lastLedgerSequence: cap,
+                lastLedgerSequence: lls,
                 sequence: seq,
+                tenantAddress: TENANT_ADDRESS,
             });
             return { hash, code: 'tesSUCCESS' };
         },

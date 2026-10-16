@@ -159,49 +159,51 @@ describe('Phase 1 queue core', () => {
         assert.strictEqual(node.lifeMoments, 1);
     });
 
-    it('dequeues EXTEND when quorum observations report tesSUCCESS with real tx hash', async () => {
-        const { unlPubkey } = require('./consensus-input-helpers');
-        const { quorumExtendObservationMessages } = require('./consensus-test-helpers');
+    it('dequeues EXTEND when ledger reports tesSUCCESS for pinned tx hash', async () => {
+        const { buildPinnedExtendTx } = require('../../dist/cluster/ExtendPinning');
         const lls = DEFAULT_ANCHOR + 30;
-        const realHash = 'abcd1234real_xahau_tx_hash';
         const nodes = [{
             ...defaultClusterNode(EXTEND_PUBKEY),
             lifeMoments: 1,
             targetLifeMoments: 5,
         }];
+        const op = {
+            type: OperationType.EXTEND_NODE,
+            ref: EXTEND_PUBKEY,
+            data: { nodePubkey: EXTEND_PUBKEY, moments: 4 },
+        };
+        const snap = {
+            lclSeqNo: 1,
+            lclHash: 'h',
+            anchorLedger: DEFAULT_ANCHOR,
+            tenantSequence: 42,
+            tenantAddress: require('./cluster-test-helpers').TENANT_ADDRESS,
+            feeCeiling: '12000000',
+            hostList: ['host.alpha', 'host.beta'],
+            cluster: { nodes, pendingNodes: [], initialized: true },
+            operations: [op],
+            acquireData: { acquiredNodes: [], pendingAcquires: [] },
+            unl: [],
+            signerList: null,
+            extendLedgerChecks: [],
+        };
+        const pin = buildPinnedExtendTx(snap, op, { operations: [op], consumedTenantSequences: [] });
         writeClusterFiles({
             nodes,
             anchorLedger: DEFAULT_ANCHOR,
-            operations: [{
-                type: OperationType.EXTEND_NODE,
-                ref: EXTEND_PUBKEY,
-                data: { nodePubkey: EXTEND_PUBKEY, moments: 4 },
-            }],
+            agreedTenantSequence: 42,
+            operations: [op],
+            pinnedExtendTxs: { [EXTEND_PUBKEY]: pin },
         });
-        const unl = [0, 1, 2, 3, 4].map((i) => unlPubkey(i));
-        const ctx = buildClusterContext({}, {
-            getContractConfig: async () => ({
-                unl,
-                evernode: {
-                    hosts: ['host.alpha', 'host.beta'],
-                    feeCeiling: '12000000',
-                    anchorLedger: DEFAULT_ANCHOR,
-                    tenantSequence: 42,
-                },
-                consensus: { roundtime: 1000, stage_slice: 100 },
-                max_input_ledger_offset: 32,
-            }),
-        });
-        const messages = quorumExtendObservationMessages({
-            anchorLedger: DEFAULT_ANCHOR,
-            tenantSequence: 42,
-            opRef: EXTEND_PUBKEY,
-            txHash: realHash,
-            lastLedgerSequence: lls,
-        });
-        await ctx.processConsensusUserInputs({
-            list: () => messages.map((m, idx) => ({ publicKey: m.userPublicKey, inputs: [[idx, m.payload.length]] })),
-            read: async ([idx]) => messages[idx].payload,
+        const ctx = buildClusterContext({
+            xrplContext: {
+                getTxAt: async (hash, idx) => (
+                    hash === pin.txHash && idx === lls
+                        ? { resultCode: 'tesSUCCESS', lastLedgerSequence: lls }
+                        : null
+                ),
+                getValidatedLedgerIndex: () => DEFAULT_ANCHOR + 30,
+            },
         });
         await ctx.init();
         await ctx.deinit();

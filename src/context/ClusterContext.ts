@@ -14,7 +14,6 @@ import {
     operationNextAttemptLcl,
 } from "../cluster/OperationQueueProcessor";
 import { FrozenRoundSnapshot, RoundSnapshot } from "../cluster/RoundSnapshot";
-import { pickHostForOpRef } from "../cluster/DeterministicTx";
 import { AllVoteElector } from "../vote/vote-electors";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
@@ -22,7 +21,14 @@ import { error, info, log } from "../helpers/logger";
 import { JSONHelpers } from "../utils";
 import { applyObservationInputs, parseAnchorUserMessage, ANCHOR_OBSERVATION_MESSAGE_TYPE, NODE_USER_REGISTER_MESSAGE_TYPE } from "../cluster/AnchorObservation";
 import { requireMaxInputLedgerOffset } from "../cluster/QueueConfig";
-import { readTenantSequence, syncConsumedTenantSequenceFromQuorum } from "../cluster/DeterministicTx";
+import { readTenantSequence, txSubmitInfoFromPinnedExtend } from "../cluster/DeterministicTx";
+import {
+    clearPinnedExtendTx,
+    detectPinnedExtendConflict,
+    ensurePinnedExtendTx,
+    findInFlightExtendRef,
+    getPinnedExtendTx,
+} from "../cluster/ExtendPinning";
 const DUMMY_OWNER_PUBKEY = "dummy_owner_pubkey";
 const SASHIMONO_NODEJS_IMAGE = "evernodedev/sashimono:hp.0.6.4-ubt.20.04-njs.20";
 const ALIVENESS_CHECK_THRESHOLD = 5;
@@ -227,20 +233,24 @@ class ClusterContext {
             hostList: evernodeCfg.hosts,
         };
 
+        const ledger = this.#ledgerReader();
         const extendLedgerChecks = [];
         for (const op of operationDataCopy.operations) {
             if (op.type !== OperationType.EXTEND_NODE)
                 continue;
-            const agreed = this.operationData.agreedExtendResults?.[op.ref];
-            const hash = agreed?.hash ?? '';
-            const lls = agreed?.lastLedgerSequence ?? 0;
-            const tx = agreed && agreed.resultCode === 'tesSUCCESS'
-                ? {
-                    hash: agreed.hash,
-                    resultCode: agreed.resultCode,
-                    lastLedgerSequence: agreed.lastLedgerSequence,
-                }
-                : null;
+            const pin = this.operationData.pinnedExtendTxs?.[op.ref];
+            const hash = pin?.txHash ?? '';
+            const lls = pin?.lastLedgerSequence ?? 0;
+            let tx = null;
+            if (pin && hash) {
+                const ledgerTx = await ledger.getTxAt(hash, lls);
+                if (ledgerTx?.resultCode === 'tesSUCCESS')
+                    tx = {
+                        hash,
+                        resultCode: 'tesSUCCESS',
+                        lastLedgerSequence: lls,
+                    };
+            }
             extendLedgerChecks.push({ ref: op.ref, hash, lastLedgerSequence: lls, tx });
         }
 
@@ -318,28 +328,46 @@ class ClusterContext {
             const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
             if (snapNode && snapNode.lifeMoments < snapNode.targetLifeMoments)
                 this.clusterManager.increaseLifeMoments(data.nodePubkey, data.moments);
-            const seq = readTenantSequence(snapshot);
+            const pin = getPinnedExtendTx(this.operationData, operation.ref);
+            const seq = pin?.sequence ?? readTenantSequence(snapshot);
             if (!this.operationData.consumedTenantSequences)
                 this.operationData.consumedTenantSequences = [];
             if (!this.operationData.consumedTenantSequences.includes(seq))
                 this.operationData.consumedTenantSequences.push(seq);
+            const agreed = this.operationData.agreedTenantSequence ?? seq;
+            if (seq >= agreed)
+                this.operationData.agreedTenantSequence = seq + 1;
+            clearPinnedExtendTx(this.operationData, operation.ref);
             this.updatedData = true;
         }
     }
 
-    async #performExtendOperation(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<void> {
+    async #performExtendOperation(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<'submitted' | 'skipped'> {
         const ledger = this.#ledgerReader();
         if (await isOperationComplete(operation, snapshot, ledger))
-            return;
+            return 'skipped';
 
-        const seq = readTenantSequence(snapshot);
-        if (this.operationData.consumedTenantSequences?.includes(seq))
-            return;
+        if (operation.extendHoldReason)
+            return 'skipped';
 
-        if (syncConsumedTenantSequenceFromQuorum(this.operationData, snapshot)) {
+        const conflict = detectPinnedExtendConflict(this.operationData, operation);
+        if (conflict) {
+            operation.extendHoldReason = conflict;
+            error(`Extend op ${operation.ref} held: ${conflict}`);
             this.updatedData = true;
-            return;
+            return 'skipped';
         }
+
+        const pin = ensurePinnedExtendTx(this.operationData, operation, snapshot);
+        if (!pin) {
+            log(`Extend op ${operation.ref} waiting: another extend in flight`);
+            return 'skipped';
+        }
+        this.updatedData = true;
+
+        const seq = pin.sequence;
+        if (this.operationData.consumedTenantSequences?.includes(seq))
+            return 'skipped';
 
         const tenantAddress = snapshot.tenantAddress;
         const onLedgerSeq = await this.evernodeContext.xrplContext.getAccountSequenceAtForObservation(
@@ -347,20 +375,21 @@ class ClusterContext {
             snapshot.anchorLedger,
         );
         if (onLedgerSeq === null || onLedgerSeq > seq)
-            return;
+            return 'skipped';
 
         const data = operation.data as ExtendNodeOperation;
         const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
         if (!snapNode)
-            return;
+            return 'skipped';
 
-        const host = pickHostForOpRef(snapshot, operation.ref);
-        log(`Extending node ${snapNode.pubkey} by ${data.moments} via host ${host}...`);
-        await this.evernodeContext.extendSubmit(host, data.moments, snapNode.name, {
-            txSubmitInfo: this.evernodeContext.xrplContext.deriveTxSubmitInfo(snapshot),
+        log(`Extending node ${snapNode.pubkey} by ${data.moments} via host ${pin.host}...`);
+        await this.evernodeContext.extendSubmit(pin.host, data.moments, snapNode.name, {
+            txSubmitInfo: txSubmitInfoFromPinnedExtend(pin),
             extendOpRef: operation.ref,
             extendSequence: seq,
+            pinnedExtendTxHash: pin.txHash,
         });
+        return 'submitted';
     }
 
     /**
@@ -403,28 +432,48 @@ class ClusterContext {
             if (operation.type !== OperationType.EXTEND_NODE)
                 continue;
 
+            if (operation.extendHoldReason)
+                continue;
+
+            const inFlight = findInFlightExtendRef(this.operationData, snapshot.anchorLedger);
+            if (inFlight && inFlight !== operation.ref)
+                continue;
+
             const nextAttempt = operationNextAttemptLcl(operation);
             if (nextAttempt !== undefined && nextAttempt > curLcl)
                 continue;
 
-            const attempt = operationAttempt(operation) + 1;
-            operation.attempt = attempt;
-            delete operation.retryCount;
-            operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
-            delete operation.nextRetryLcl;
-            this.updatedData = true;
-
-            if (attempt > MAX_OPERATION_ATTEMPTS) {
+            if (operationAttempt(operation) >= MAX_OPERATION_ATTEMPTS) {
                 error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_ATTEMPTS} failed attempts.`);
                 this.operationData.operations.splice(i, 1);
+                this.updatedData = true;
                 actions++;
                 break;
             }
 
             try {
-                await this.#performExtendOperation(operation, snapshot);
+                const outcome = await this.#performExtendOperation(operation, snapshot);
+                if (outcome === 'submitted') {
+                    const attempt = operationAttempt(operation) + 1;
+                    operation.attempt = attempt;
+                    delete operation.retryCount;
+                    operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
+                    delete operation.nextRetryLcl;
+                    this.updatedData = true;
+                }
             } catch (e) {
+                const attempt = operationAttempt(operation) + 1;
+                operation.attempt = attempt;
+                delete operation.retryCount;
+                operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
+                delete operation.nextRetryLcl;
+                this.updatedData = true;
                 error(e);
+                if (attempt >= MAX_OPERATION_ATTEMPTS) {
+                    error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_ATTEMPTS} failed attempts.`);
+                    this.operationData.operations.splice(i, 1);
+                    this.updatedData = true;
+                }
             }
             actions++;
             break;

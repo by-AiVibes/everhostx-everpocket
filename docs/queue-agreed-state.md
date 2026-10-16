@@ -24,9 +24,9 @@ Phase 1 does **not** use NPL votes for anchor or queue tx fields. Agreed inputs 
 
 ## Tx hash / completion
 
-- Extend tx hash is **recomputed** each round (`computeExtendTxHash`); never taken from a local submit response.
-- Observations may carry `submittedTx` entries; quorum-agreed hashes land in `agreedExtendResults` and may satisfy completion when pinned ledger has not yet caught up.
-- Completion = `tesSUCCESS` at pinned `getTxAt` or matching quorum-agreed result for the deterministic hash.
+- On first extend attempt, agreed `pinnedExtendTxs[opRef]` stores sequence, LLS, fee, host, and **stable** `txHash` from that round’s snapshot. Retries reuse the pin; the hash never moves.
+- At most one extend is in flight (pinned LLS ≥ agreed anchor). The next extend pins only after the prior op completes or its pin is eligible for re-pin (LLS &lt; anchor and quorum shows the pinned sequence unconsumed).
+- Completion = ledger `tesSUCCESS` at the pinned hash and LLS (`getTxAt`). Quorum `agreedExtendResults` with a **different** hash than the pin holds the op with a logged reason (no blind resubmit).
 
 ## Host
 

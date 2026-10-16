@@ -11,7 +11,9 @@ const { initLedger, readLedger, writeLedger, writePinnedRound, mergeSubmitIntent
 const { OperationType } = require('../../dist/models/cluster');
 
 const NODE_COUNT = 5;
-const EXTEND_PUBKEY = 'sim_extend_pubkey';
+const EXTEND_PUBKEY_A = 'sim_extend_pubkey_a';
+const EXTEND_PUBKEY_B = 'sim_extend_pubkey_b';
+const EXTEND_REFS = [EXTEND_PUBKEY_A, EXTEND_PUBKEY_B];
 const SHARED_LCL_HASH = 'cafebabe00cafebabe00cafebabe00cafebabe';
 const ROUNDS_PER_SEED = 100;
 const SEED_COUNT = 10;
@@ -32,19 +34,18 @@ function seedNodeDirs(workRoot) {
         fs.writeFileSync(path.join(full, 'acquires.json'), JSON.stringify({ acquiredNodes: [], pendingAcquires: [] }));
         fs.writeFileSync(path.join(full, 'cluster.json'), JSON.stringify({
             initialized: true,
-            nodes: [{
-                ...defaultClusterNode(EXTEND_PUBKEY),
-                lifeMoments: 1,
-                targetLifeMoments: 200,
-            }],
+            nodes: [
+                { ...defaultClusterNode(EXTEND_PUBKEY_A), lifeMoments: 1, targetLifeMoments: 200 },
+                { ...defaultClusterNode(EXTEND_PUBKEY_B), lifeMoments: 1, targetLifeMoments: 200 },
+            ],
             pendingNodes: [],
         }, null, 4));
         fs.writeFileSync(path.join(full, 'operations.json'), JSON.stringify({
-            operations: [{
-                type: OperationType.EXTEND_NODE,
-                ref: EXTEND_PUBKEY,
-                data: { nodePubkey: EXTEND_PUBKEY, moments: 1 },
-            }],
+            operations: [
+                { type: OperationType.ADD_NODE, ref: 'sim_add_held', data: { acquireOptions: {}, lifeMoments: 1 } },
+                { type: OperationType.EXTEND_NODE, ref: EXTEND_PUBKEY_A, data: { nodePubkey: EXTEND_PUBKEY_A, moments: 1 } },
+                { type: OperationType.EXTEND_NODE, ref: EXTEND_PUBKEY_B, data: { nodePubkey: EXTEND_PUBKEY_B, moments: 1 } },
+            ],
             anchorLedger: DEFAULT_ANCHOR,
             agreedTenantSequence: DEFAULT_TENANT_SEQUENCE,
         }, null, 4));
@@ -138,10 +139,12 @@ describe('queue-sim multiprocess (phase 1)', () => {
                         : baseValidated + (i % 3);
                 }
                 writeLedger(seedRoot, ledger);
+                const agreedSeq = JSON.parse(fs.readFileSync(path.join(seedRoot, 'n0', 'operations.json'), 'utf8'))
+                    .agreedTenantSequence ?? DEFAULT_TENANT_SEQUENCE;
                 writePinnedRound(seedRoot, round, {
                     anchor: anchorForPin,
                     tenantAddress: TENANT_ADDRESS,
-                    tenantSequence: DEFAULT_TENANT_SEQUENCE,
+                    tenantSequence: agreedSeq,
                 });
 
                 const lcl = 100 + seed * 10 + round * 4;
@@ -171,8 +174,10 @@ describe('queue-sim multiprocess (phase 1)', () => {
                 `seed ${seed}: anchor must advance under mixed local views (max ${maxAnchorSeen})`);
 
             const ledger = readLedger(seedRoot);
-            assert.strictEqual(ledger.landedCountByRef[EXTEND_PUBKEY] ?? 0, 1,
-                `seed ${seed}: expected exactly one landed extend tx per op`);
+            for (const ref of EXTEND_REFS) {
+                assert.strictEqual(ledger.landedCountByRef[ref] ?? 0, 1,
+                    `seed ${seed}: expected exactly one landed extend tx for ${ref}`);
+            }
         }
     });
 

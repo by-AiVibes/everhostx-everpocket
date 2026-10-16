@@ -4,7 +4,7 @@ import {
     OperationType,
 } from '../models/cluster';
 import { SignerListInfo } from '../models';
-import { buildLastLedgerSequenceFromSnapshot, computeExtendTxHash } from './DeterministicTx';
+import { buildLastLedgerSequenceFromSnapshot } from './DeterministicTx';
 
 export const MAX_OPERATION_ATTEMPTS = 8;
 export const MAX_OPS_PER_ROUND = 1;

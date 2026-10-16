@@ -41,17 +41,27 @@ function readAcquiresFile() {
     return JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
 }
 
-function writeClusterFiles({ nodes = [], pendingNodes = [], operations, anchorLedger = DEFAULT_ANCHOR, agreedTenantSequence = DEFAULT_TENANT_SEQUENCE }) {
+function writeClusterFiles({
+    nodes = [],
+    pendingNodes = [],
+    operations,
+    anchorLedger = DEFAULT_ANCHOR,
+    agreedTenantSequence = DEFAULT_TENANT_SEQUENCE,
+    pinnedExtendTxs,
+}) {
     fs.writeFileSync('cluster.json', JSON.stringify({
         initialized: true,
         nodes,
         pendingNodes,
     }, null, 4));
-    fs.writeFileSync('operations.json', JSON.stringify({
+    const opsPayload = {
         operations,
         anchorLedger,
         agreedTenantSequence,
-    }, null, 4));
+    };
+    if (pinnedExtendTxs)
+        opsPayload.pinnedExtendTxs = pinnedExtendTxs;
+    fs.writeFileSync('operations.json', JSON.stringify(opsPayload, null, 4));
 }
 
 function defaultClusterNode(pubkey) {

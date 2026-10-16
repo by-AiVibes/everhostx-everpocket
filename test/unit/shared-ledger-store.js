@@ -98,7 +98,11 @@ function ledgerBackendFromPinned(root, round, nodeId) {
         },
         getTxAt: async (hash, ledgerIndex) => {
             const data = read();
-            return data.txs[`${ledgerIndex}:${hash}`] ?? null;
+            const pinnedTx = data.txs[`${ledgerIndex}:${hash}`];
+            if (pinnedTx)
+                return pinnedTx;
+            const live = readLedger(root);
+            return live.txs[`${ledgerIndex}:${hash}`] ?? null;
         },
         getSignerListAt: async (ledgerIndex) => {
             const data = read();
@@ -119,13 +123,20 @@ function ledgerBackendFromPinned(root, round, nodeId) {
             const data = read();
             return data.nodePendingSubmits[nodeId] ?? [];
         },
-        recordSubmitIntent: ({ ref, hash, lastLedgerSequence, sequence }) => {
+        recordSubmitIntent: ({ ref, hash, lastLedgerSequence, sequence, tenantAddress }) => {
             const ledger = readLedger(root);
             if ((ledger.landedCountByRef[ref] || 0) >= 1)
                 return;
             if (!ledger.landedHashes[hash]) {
                 ledger.landedHashes[hash] = true;
                 ledger.landedCountByRef[ref] = 1;
+            }
+            if (tenantAddress) {
+                const nextSeq = sequence + 1;
+                for (const key of Object.keys(ledger.accountSequences)) {
+                    if (key.endsWith(`:${tenantAddress}`))
+                        ledger.accountSequences[key] = nextSeq;
+                }
             }
             const tx = {
                 hash,
