@@ -99,7 +99,8 @@ describe('Operation queue determinism (no vote-majority)', () => {
         const parsed = payloads.map((p) => JSON.parse(p));
         assert.deepStrictEqual(parsed[0], parsed[1]);
         assert.deepStrictEqual(parsed[1], parsed[2]);
-        assert.ok((parsed[0].operations[0]?.retryCount || 0) >= 1);
+        const op0 = parsed[0].operations[0];
+        assert.ok((op0?.attempt ?? op0?.retryCount ?? 0) >= 1);
     });
 
     it('dequeues on all nodes when agreed REMOVE state is already complete', async () => {
@@ -175,7 +176,8 @@ describe('Operation queue determinism (no vote-majority)', () => {
         for (let i = 1; i < parsed.length; i++) {
             assert.deepStrictEqual(parsed[0], parsed[i]);
         }
-        assert.ok((parsed[0].operations[0]?.retryCount || 0) >= 1);
+        const op0 = parsed[0].operations[0];
+        assert.ok((op0?.attempt ?? op0?.retryCount ?? 0) >= 1);
     }
 
     it('3 nodes with one missing votes: identical operations.json', async () => {

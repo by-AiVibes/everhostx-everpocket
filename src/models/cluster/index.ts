@@ -59,29 +59,46 @@ export interface ClusterMessageResponse {
 export interface AddNodeOperation {
   acquireOptions: AcquireOptions;
   lifeMoments: number;
-  maxLifeMoments?: number
+  maxLifeMoments?: number;
+  acquireTxHash?: string;
+  acquireLedgerCap?: number;
+  leaseOfferIdx?: string;
+  host?: string;
 }
 
 export interface ExtendNodeOperation {
   nodePubkey: string;
   moments: number;
+  extendTxHash?: string;
+  extendLedgerCap?: number;
 }
+
+export type RemoveNodeStep = 'SIGNER' | 'UNL' | 'PEER' | 'DONE';
 
 export interface RemoveNodeOperation {
   nodePubkey: string;
   force: boolean;
+  step?: RemoveNodeStep;
+  signerTxCap?: number;
+  newSignerAddress?: string;
 }
 
 export interface Operation {
   type: OperationType,
   ref: string,
   data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation,
-  retryCount?: number,
-  nextRetryLcl?: number
+  attempt?: number;
+  nextAttemptLcl?: number;
+  createdLcl?: number;
+  /** @deprecated migrated to attempt */
+  retryCount?: number;
+  /** @deprecated migrated to nextAttemptLcl */
+  nextRetryLcl?: number;
 }
 
 export interface OperationData {
-  operations: Operation[]
+  operations: Operation[];
+  anchorLedger?: number;
 }
 
 export enum ClusterMessageType {

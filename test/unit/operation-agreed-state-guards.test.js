@@ -53,7 +53,7 @@ describe('Operation agreed-state guards (behavioral)', () => {
         await ctx.deinit();
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
-        assert.ok((ops.operations[0].retryCount || 0) >= 1);
+        assert.ok((ops.operations[0].attempt ?? ops.operations[0].retryCount ?? 0) >= 1);
     });
 
     it('advances retry after perform even when local REMOVE steps succeed', async () => {
@@ -81,7 +81,7 @@ describe('Operation agreed-state guards (behavioral)', () => {
         await ctx.deinit();
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
-        assert.ok(ops.operations[0].retryCount >= 1);
+        assert.ok((ops.operations[0].attempt ?? ops.operations[0].retryCount ?? 0) >= 1);
     });
 
     it('does not treat ADD as complete when only a different pending acquire exists', async () => {
@@ -137,7 +137,7 @@ describe('Operation agreed-state guards (behavioral)', () => {
     });
 
     it('removes cluster zombie when REMOVE is dropped after partial UNL drop', async () => {
-        const MAX_OPERATION_RETRY_ATTEMPTS = 32;
+        const MAX_OPERATION_ATTEMPTS = 8;
         const { hpOverrides } = consensusContract([]);
         writeClusterFiles({
             nodes: [{ ...defaultClusterNode(REMOVE_PUBKEY), isUnl: true, domain: 'z.example', peerPort: 11 }],
@@ -146,7 +146,7 @@ describe('Operation agreed-state guards (behavioral)', () => {
                 type: OperationType.REMOVE_NODE,
                 ref: REMOVE_PUBKEY,
                 data: { nodePubkey: REMOVE_PUBKEY, force: true },
-                retryCount: MAX_OPERATION_RETRY_ATTEMPTS - 1,
+                attempt: MAX_OPERATION_ATTEMPTS - 1,
             }],
         });
         const ctx = buildClusterContext({

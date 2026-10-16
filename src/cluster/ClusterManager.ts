@@ -77,6 +77,11 @@ class ClusterManager {
      * Get the pending nodes.
      * @returns List of pending nodes.
      */
+    /** Deep copy for frozen round snapshots (must not reflect mid-round mutations). */
+    public snapshotClusterData(): ClusterData {
+        return JSON.parse(JSON.stringify(this.clusterData));
+    }
+
     public getPending(): PendingNode[] {
         return this.clusterData.pendingNodes;
     }

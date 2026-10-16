@@ -19,8 +19,12 @@ function consensusContract(unlPubkeys = []) {
     };
 }
 
-function writeAcquiresFile() {
-    fs.writeFileSync('acquires.json', JSON.stringify({ acquiredNodes: [], pendingAcquires: [] }));
+function writeAcquiresFile(acquireData = { acquiredNodes: [], pendingAcquires: [] }) {
+    fs.writeFileSync('acquires.json', JSON.stringify(acquireData));
+}
+
+function readAcquiresFile() {
+    return JSON.parse(fs.readFileSync('acquires.json', 'utf8'));
 }
 
 function writeClusterFiles({ nodes = [], pendingNodes = [], operations }) {
@@ -45,6 +49,7 @@ function defaultClusterNode(pubkey) {
 }
 
 function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
+    const { xrplContext: xrplOverrides, ...restEvernodeOverrides } = evernodeContextOverrides;
     const hpContext = {
         publicKey: 'self_pubkey',
         contractId: 'contract_id',
@@ -72,12 +77,18 @@ function buildClusterContext(evernodeContextOverrides = {}, hpOverrides = {}) {
         voteContext,
         init: async () => {},
         deinit: async () => {},
+        getAcquireDataSnapshot: () => readAcquiresFile(),
         getIfAcquired: () => null,
         getIfPending: () => false,
         acquireNode: async () => { throw new Error('acquire should not run'); },
         extendSubmit: async () => false,
-        xrplContext: { multiSigner: { isSignerNode: () => false, getSigner: () => null } },
-        ...evernodeContextOverrides,
+        xrplContext: {
+            getValidatedLedgerIndex: () => 1_000_000,
+            getSignerList: () => null,
+            multiSigner: { isSignerNode: () => false, getSigner: () => null },
+            ...(xrplOverrides || {}),
+        },
+        ...restEvernodeOverrides,
     };
 
     evernodeContext.hpContext = hpContext;
@@ -98,14 +109,35 @@ function createAcquireTxHarness() {
     const acquiredByTx = new Map();
     let txSeq = 0;
 
+    function syncAcquiresFile() {
+        const pendingAcquires = [...pendingTxHashes].map((refId) => ({
+            refId,
+            host: 'host.example',
+            leaseOfferIdx: 'idx',
+            messageKey: 'mk',
+            acquireSentOnLcl: 0,
+        }));
+        const acquiredNodes = [...acquiredByTx.entries()].map(([refId, info]) => ({
+            refId,
+            host: 'host.example',
+            ...info,
+        }));
+        writeAcquiresFile({ pendingAcquires, acquiredNodes });
+    }
+
     const evernodeOverrides = {
         acquireNode: async () => {
             const refId = `0xacquire_tx_${++txSeq}`;
             pendingTxHashes.add(refId);
+            syncAcquiresFile();
             return { refId, host: 'host.example' };
         },
-        getIfPending: (refId) => pendingTxHashes.has(refId),
+        getIfPending: (refId) => {
+            const pending = readAcquiresFile().pendingAcquires.find((n) => n.refId === refId);
+            return pending || null;
+        },
         getIfAcquired: (refId) => acquiredByTx.get(refId) ?? null,
+        getAcquireDataSnapshot: () => readAcquiresFile(),
     };
 
     return {
@@ -115,6 +147,7 @@ function createAcquireTxHarness() {
         markAcquired(refId, info) {
             pendingTxHashes.delete(refId);
             acquiredByTx.set(refId, info);
+            syncAcquiresFile();
         },
     };
 }

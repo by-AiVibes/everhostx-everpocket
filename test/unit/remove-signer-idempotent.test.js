@@ -109,7 +109,7 @@ describe('REMOVE signer step idempotency', () => {
 
         let ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
-        let nextRetryLcl = ops.operations[0].nextRetryLcl;
+        let nextRetryLcl = ops.operations[0].nextAttemptLcl ?? ops.operations[0].nextRetryLcl;
 
         for (let attempt = 0; attempt < 6 && ops.operations.length > 0; attempt++) {
             const ctxN = makeContext(nextRetryLcl);
@@ -119,7 +119,7 @@ describe('REMOVE signer step idempotency', () => {
             if (ops.operations.length === 0) {
                 break;
             }
-            nextRetryLcl = ops.operations[0].nextRetryLcl;
+            nextRetryLcl = ops.operations[0].nextAttemptLcl ?? ops.operations[0].nextRetryLcl;
         }
 
         assert.strictEqual(replaceCalls, 1);

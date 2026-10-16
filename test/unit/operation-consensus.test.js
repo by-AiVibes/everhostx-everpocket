@@ -88,6 +88,7 @@ describe('Operation queue consensus (agreed-state dequeue)', () => {
         const opsA = fs.readFileSync(path.join(nodeADir, 'operations.json'), 'utf8');
         const opsB = fs.readFileSync(path.join(nodeBDir, 'operations.json'), 'utf8');
         assert.deepStrictEqual(JSON.parse(opsA), JSON.parse(opsB));
-        assert.ok((JSON.parse(opsA).operations[0]?.retryCount || 0) >= 1);
+        const op0 = JSON.parse(opsA).operations[0];
+        assert.ok((op0?.attempt ?? op0?.retryCount ?? 0) >= 1);
     });
 });

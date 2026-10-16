@@ -56,8 +56,8 @@ describe('Fix 1: re-queue failed operations with retry metadata', () => {
         const ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
         assert.strictEqual(ops.operations[0].ref, DEAD_PUBKEY);
-        assert.ok((ops.operations[0].retryCount || 0) >= 1);
-        assert.ok(ops.operations[0].nextRetryLcl !== undefined);
+        assert.ok((ops.operations[0].attempt ?? ops.operations[0].retryCount ?? 0) >= 1);
+        assert.ok((ops.operations[0].nextAttemptLcl ?? ops.operations[0].nextRetryLcl) !== undefined);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(cluster.nodes.some((n) => n.pubkey === DEAD_PUBKEY));
@@ -81,7 +81,7 @@ describe('Fix 1: re-queue failed operations with retry metadata', () => {
 
         let ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
-        const nextRetryLcl = ops.operations[0].nextRetryLcl;
+        const nextRetryLcl = ops.operations[0].nextAttemptLcl ?? ops.operations[0].nextRetryLcl;
 
         const ctx2 = buildClusterContext({}, { lclSeqNo: nextRetryLcl, ...hpOverrides });
         await ctx2.init();

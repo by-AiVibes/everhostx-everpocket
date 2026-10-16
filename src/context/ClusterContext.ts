@@ -4,6 +4,7 @@ import { Buffer } from 'buffer';
 import { EvernodeContext, VoteContext } from "../context";
 import { ClusterOptions, ClusterMessage, ClusterMessageResponse, ClusterMessageResponseStatus, ClusterMessageType, ClusterNode, PendingNode, OperationData, OperationType, AddNodeOperation, ExtendNodeOperation, RemoveNodeOperation, ClusterOwner, NodeStatus, NodeInfo, Operation } from "../models/cluster";
 import { ClusterManager } from "../cluster";
+import { FrozenRoundSnapshot, RoundSnapshot } from "../cluster/RoundSnapshot";
 import { AllVoteElector } from "../vote/vote-electors";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
@@ -19,18 +20,16 @@ const ACKNOWLEDGE_LCL_THRESHOLD = 2;
 const ACKNOWLEDGE_RETRY_LCL_THRESHOLD = 5;
 const MAX_ACKNOWLEDGE_ATTEMPTS = 3;
 const MAX_SIGNER_REPLACE_ATTEMPTS = 10;
-const MAX_OPERATION_RETRY_ATTEMPTS = 32;
+const MAX_OPERATION_ATTEMPTS = 8;
 const TIMEOUT = 10000;
 
-type RoundAgreedState = {
-    unl: string[];
-    clusterNodePubkeys: Set<string>;
-    pendingAddOpRefs: Set<string>;
-    clusterAddOpRefs: Set<string>;
-    nodeLifeMoments: Map<string, number>;
-    nodeTargetLifeMoments: Map<string, number>;
-    ledgerSignerAccounts: Set<string>;
-};
+function operationAttempt(operation: Operation): number {
+    return operation.attempt ?? operation.retryCount ?? 0;
+}
+
+function operationNextAttemptLcl(operation: Operation): number | undefined {
+    return operation.nextAttemptLcl ?? operation.nextRetryLcl;
+}
 
 class ClusterContext {
     private operationDataFile: string = "operations.json";
@@ -43,6 +42,7 @@ class ClusterContext {
     private acknowledgeLclThreshold: number;
     private acknowledgeRetryLclThreshold: number;
     private initialized: boolean = false;
+    private roundAborted: boolean = false;
     public hpContext: HotPocketContext;
     public voteContext: VoteContext;
     public evernodeContext: EvernodeContext;
@@ -71,10 +71,17 @@ class ClusterContext {
         if (this.initialized)
             return;
 
+        this.roundAborted = false;
         await this.evernodeContext.init();
 
         try {
-            const roundState = await this.#captureRoundAgreedState();
+            const snapshot = await this.#captureRoundSnapshot();
+            const validatedXahau = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
+            if (snapshot.anchorLedger > 0 && validatedXahau < snapshot.anchorLedger) {
+                this.roundAborted = true;
+                return;
+            }
+
             await this.#setupClusterInfo();
             await this.#updateActiveness();
             const aliveCheckReached = await this.#checkForPendingNodes();
@@ -83,7 +90,7 @@ class ClusterContext {
             await this.#checkForExtends();
             // Defer only new ADD operations while a pending-node aliveness probe ran this round.
             // REMOVE and EXTEND must still run so heal is not blocked by in-flight acquires.
-            await this.#processOperations(aliveCheckReached, roundState);
+            await this.#processOperations(aliveCheckReached, snapshot);
             this.initialized = true;
         } catch (e) {
             await this.deinit();
@@ -95,10 +102,13 @@ class ClusterContext {
      * Deinitiates the operations regarding the cluster.
      */
     public async deinit(): Promise<void> {
-        this.clusterManager.persist();
-        this.#persistOperationData();
+        if (!this.roundAborted) {
+            this.clusterManager.persist();
+            this.#persistOperationData();
+        }
         await this.evernodeContext.deinit();
         this.initialized = false;
+        this.roundAborted = false;
     }
 
     /**
@@ -134,7 +144,9 @@ class ClusterContext {
             this.operationData.operations.push({
                 type: type,
                 ref: ref,
-                data: data
+                data: data,
+                createdLcl: this.hpContext.lclSeqNo,
+                attempt: 0,
             });
         this.updatedData = true;
     }
@@ -158,74 +170,99 @@ class ClusterContext {
             const op = this.operationData.operations[i];
             if (deferAdd && op.type === OperationType.ADD_NODE)
                 continue;
-            if (op.nextRetryLcl !== undefined && op.nextRetryLcl > curLcl)
+            const nextAttempt = operationNextAttemptLcl(op);
+            if (nextAttempt !== undefined && nextAttempt > curLcl)
                 continue;
             return i;
         }
         return -1;
     }
 
-    async #captureRoundAgreedState(): Promise<RoundAgreedState> {
+    async #captureRoundSnapshot(): Promise<FrozenRoundSnapshot> {
         const config = await this.hpContext.getContractConfig();
         const signerList = this.evernodeContext.xrplContext.getSignerList?.() ?? null;
-        const ledgerSignerAccounts = new Set(
-            (signerList?.signerList || []).map((s) => s.account),
-        );
-        const nodes = this.getClusterNodes();
-        return {
-            unl: [...config.unl],
-            clusterNodePubkeys: new Set(nodes.map((n) => n.pubkey)),
-            pendingAddOpRefs: new Set(this.getPendingNodes().map((p) => p.opRef).filter((r): r is string => !!r)),
-            clusterAddOpRefs: new Set(nodes.map((n) => n.addOpRef).filter((r): r is string => !!r)),
-            nodeLifeMoments: new Map(nodes.map((n) => [n.pubkey, n.lifeMoments])),
-            nodeTargetLifeMoments: new Map(nodes.map((n) => [n.pubkey, n.targetLifeMoments])),
-            ledgerSignerAccounts,
-        };
+        return RoundSnapshot.capture({
+            lclSeqNo: this.hpContext.lclSeqNo,
+            operationData: JSON.parse(JSON.stringify(this.operationData)),
+            clusterData: this.clusterManager.snapshotClusterData(),
+            acquireData: this.evernodeContext.getAcquireDataSnapshot(),
+            contractUnl: config.unl,
+            signerListInfo: signerList,
+        });
     }
 
-    #isOperationCompleteInAgreedState(operation: Operation, roundState: RoundAgreedState): boolean {
+    async #isOperationComplete(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<boolean> {
+        const clusterNodes = snapshot.cluster.nodes;
+        const pendingNodes = snapshot.cluster.pendingNodes;
         if (operation.type === OperationType.REMOVE_NODE) {
             const pubkey = (operation.data as RemoveNodeOperation).nodePubkey;
-            return !roundState.unl.includes(pubkey) && !roundState.clusterNodePubkeys.has(pubkey);
+            const inUnl = snapshot.unl.includes(pubkey);
+            const inCluster = clusterNodes.some((n) => n.pubkey === pubkey);
+            return !inUnl && !inCluster;
         }
         if (operation.type === OperationType.ADD_NODE) {
-            return roundState.pendingAddOpRefs.has(operation.ref)
-                || roundState.clusterAddOpRefs.has(operation.ref);
+            const pendingMatch = pendingNodes.some((p) => p.opRef === operation.ref);
+            const clusterMatch = clusterNodes.some((n) => n.addOpRef === operation.ref);
+            return pendingMatch || clusterMatch;
         }
         if (operation.type === OperationType.EXTEND_NODE) {
             const data = operation.data as ExtendNodeOperation;
-            const life = roundState.nodeLifeMoments.get(data.nodePubkey);
-            const target = roundState.nodeTargetLifeMoments.get(data.nodePubkey);
-            return life !== undefined && target !== undefined && life >= target;
+            const node = clusterNodes.find((n) => n.pubkey === data.nodePubkey);
+            return !!node && node.lifeMoments >= node.targetLifeMoments;
         }
         return false;
     }
 
+    async #isAddAcquireExpiredOnXahau(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<boolean> {
+        const data = operation.data as AddNodeOperation;
+        const hash = data.acquireTxHash;
+        if (!hash || !data.acquireLedgerCap)
+            return false;
+        if (snapshot.anchorLedger < data.acquireLedgerCap)
+            return false;
+        const tx = await this.evernodeContext.xrplContext.getTxAt(hash, snapshot.anchorLedger);
+        if (!tx)
+            return false;
+        if (tx.resultCode === 'tesSUCCESS')
+            return false;
+        return tx.lastLedgerSequence <= snapshot.anchorLedger;
+    }
+
     async #advanceOperationRetrySchedule(operation: Operation, operationIndex: number, curLcl: number): Promise<void> {
-        const retryCount = (operation.retryCount || 0) + 1;
-        operation.retryCount = retryCount;
-        if (retryCount >= MAX_OPERATION_RETRY_ATTEMPTS) {
-            error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_RETRY_ATTEMPTS} failed attempts.`);
+        const attempt = operationAttempt(operation) + 1;
+        operation.attempt = attempt;
+        delete operation.retryCount;
+        if (attempt >= MAX_OPERATION_ATTEMPTS) {
+            error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_ATTEMPTS} failed attempts.`);
             if (operation.type === OperationType.REMOVE_NODE) {
                 const pubkey = (operation.data as RemoveNodeOperation).nodePubkey;
                 await this.#reconcileRemoveZombieFromConsensusUnl(pubkey);
             }
             this.operationData.operations.splice(operationIndex, 1);
         } else {
-            const backoffLcl = Math.min(2 ** retryCount, 32);
-            operation.nextRetryLcl = curLcl + backoffLcl;
+            const backoffLcl = Math.min(2 ** attempt, 32);
+            operation.nextAttemptLcl = curLcl + backoffLcl;
+            delete operation.nextRetryLcl;
         }
         this.updatedData = true;
     }
 
 
-    async #performOperation(operation: Operation, roundState: RoundAgreedState): Promise<void> {
+    async #performOperation(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<void> {
             if (operation.type === OperationType.ADD_NODE) {
                 const data = operation.data as AddNodeOperation;
 
+                if (data.acquireTxHash && !(await this.#isAddAcquireExpiredOnXahau(operation, snapshot))) {
+                    log(`ADD ${operation.ref} waiting on Xahau acquire ${data.acquireTxHash}`);
+                    return;
+                }
+
                 log(`Acquiring a new node...`);
-                let acquire = (await this.evernodeContext.acquireNode(data.acquireOptions)) as PendingNode;
+                let acquire = (await this.evernodeContext.acquireNode(data.acquireOptions, operation.ref)) as PendingNode;
                 acquire.opRef = operation.ref;
+                data.acquireTxHash = acquire.refId;
+                if (acquire.acquireLedgerCap)
+                    data.acquireLedgerCap = acquire.acquireLedgerCap;
                 acquire.targetLifeMoments = data.lifeMoments;
                 acquire.maxLifeMoments = data.maxLifeMoments;
                 acquire.aliveCheckCount = 0;
@@ -366,7 +403,7 @@ class ClusterContext {
     /**
      * Process operations one by one at each execution.
      */
-    async #processOperations(deferAdd: boolean = false, roundState: RoundAgreedState) {
+    async #processOperations(deferAdd: boolean = false, snapshot: FrozenRoundSnapshot) {
         if (this.operationData.operations.length === 0)
             return;
 
@@ -376,20 +413,28 @@ class ClusterContext {
             return;
 
         const operation = this.operationData.operations[operationIndex];
-        const completeInAgreedState = this.#isOperationCompleteInAgreedState(operation, roundState);
+        const completeInSnapshot = await this.#isOperationComplete(operation, snapshot);
 
         info(`Operations processor started.`);
 
-        if (completeInAgreedState) {
+        if (completeInSnapshot) {
             this.operationData.operations.splice(operationIndex, 1);
             this.updatedData = true;
         } else {
+            let performed = false;
             try {
-                await this.#performOperation(operation, roundState);
+                await this.#performOperation(operation, snapshot);
+                performed = true;
             } catch (e) {
                 error(e);
             }
-            await this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
+            if (performed || operation.type === OperationType.ADD_NODE) {
+                const stillComplete = await this.#isOperationComplete(operation, snapshot);
+                if (!stillComplete)
+                    await this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
+            } else {
+                await this.#advanceOperationRetrySchedule(operation, operationIndex, curLcl);
+            }
         }
 
         info(`Operations processor ended.`);

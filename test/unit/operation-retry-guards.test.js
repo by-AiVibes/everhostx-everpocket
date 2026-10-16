@@ -15,7 +15,7 @@ const BLOCKED_PUBKEY = 'blocked_remove_pubkey';
 const READY_PUBKEY = 'ready_force_remove_pubkey';
 const PENDING_REF = 'pending_ref_retry_guards';
 
-const MAX_OPERATION_RETRY_ATTEMPTS = 32;
+const MAX_OPERATION_ATTEMPTS = 8;
 
 describe('Operation retry guards (regression)', () => {
     let tmpDir;
@@ -33,7 +33,7 @@ describe('Operation retry guards (regression)', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it('drops an operation after MAX_OPERATION_RETRY_ATTEMPTS failures (cap enforced)', async () => {
+    it('drops an operation after MAX_OPERATION_ATTEMPTS failures (cap enforced)', async () => {
         writeClusterFiles({
             pendingNodes: [{ refId: PENDING_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
             nodes: [defaultClusterNode(BLOCKED_PUBKEY)],
@@ -41,7 +41,7 @@ describe('Operation retry guards (regression)', () => {
                 type: 'remove_node',
                 ref: BLOCKED_PUBKEY,
                 data: { nodePubkey: BLOCKED_PUBKEY, force: false },
-                retryCount: MAX_OPERATION_RETRY_ATTEMPTS - 1,
+                attempt: MAX_OPERATION_ATTEMPTS - 1,
             }],
         });
 
@@ -58,7 +58,7 @@ describe('Operation retry guards (regression)', () => {
         assert.strictEqual(ops.operations.length, 0);
     });
 
-    it('sets nextRetryLcl strictly after curLcl (non-zero backoff)', async () => {
+    it('sets nextAttemptLcl strictly after curLcl (non-zero backoff)', async () => {
         const curLcl = 250;
         writeClusterFiles({
             pendingNodes: [{ refId: PENDING_REF, host: 'h', targetLifeMoments: 1, aliveCheckCount: 0 }],
@@ -80,9 +80,11 @@ describe('Operation retry guards (regression)', () => {
         await ctx.deinit();
 
         const op = JSON.parse(fs.readFileSync('operations.json', 'utf8')).operations[0];
-        const expectedBackoff = Math.min(2 ** (op.retryCount || 1), 32);
-        assert.strictEqual(op.nextRetryLcl, curLcl + expectedBackoff);
-        assert.ok(op.nextRetryLcl > curLcl);
+        const attempt = op.attempt ?? op.retryCount ?? 1;
+        const expectedBackoff = Math.min(2 ** attempt, 32);
+        const nextLcl = op.nextAttemptLcl ?? op.nextRetryLcl;
+        assert.strictEqual(nextLcl, curLcl + expectedBackoff);
+        assert.ok(nextLcl > curLcl);
     });
 
     it('does not run a backed-off op while a later ready op can proceed', async () => {
@@ -97,8 +99,8 @@ describe('Operation retry guards (regression)', () => {
                     type: 'remove_node',
                     ref: BLOCKED_PUBKEY,
                     data: { nodePubkey: BLOCKED_PUBKEY, force: false },
-                    retryCount: 1,
-                    nextRetryLcl: 10_000,
+                    attempt: 1,
+                    nextAttemptLcl: 10_000,
                 },
                 {
                     type: 'remove_node',
@@ -117,7 +119,7 @@ describe('Operation retry guards (regression)', () => {
         assert.strictEqual(ops.operations.length, 2);
         assert.strictEqual(ops.operations[0].ref, BLOCKED_PUBKEY);
         assert.strictEqual(ops.operations[1].ref, READY_PUBKEY);
-        assert.ok((ops.operations[1].retryCount || 0) >= 1);
+        assert.ok((ops.operations[1].attempt ?? ops.operations[1].retryCount ?? 0) >= 1);
 
         const cluster = JSON.parse(fs.readFileSync('cluster.json', 'utf8'));
         assert.ok(!cluster.nodes.some((n) => n.pubkey === READY_PUBKEY));
@@ -146,7 +148,7 @@ describe('Operation retry guards (regression)', () => {
 
         let ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
-        const nextRetryLcl = ops.operations[0].nextRetryLcl;
+        const nextRetryLcl = ops.operations[0].nextAttemptLcl ?? ops.operations[0].nextRetryLcl;
         assert.ok(nextRetryLcl > curLcl);
 
         writeClusterFiles({
@@ -164,7 +166,7 @@ describe('Operation retry guards (regression)', () => {
 
         ops = JSON.parse(fs.readFileSync('operations.json', 'utf8'));
         assert.strictEqual(ops.operations.length, 1);
-        const nextRetryLcl2 = ops.operations[0].nextRetryLcl;
+        const nextRetryLcl2 = ops.operations[0].nextAttemptLcl ?? ops.operations[0].nextRetryLcl;
 
         const ctx3 = buildClusterContext({
             getIfAcquired: () => null,

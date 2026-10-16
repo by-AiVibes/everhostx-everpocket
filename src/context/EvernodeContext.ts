@@ -212,7 +212,11 @@ class EvernodeContext {
      * @param options Options related to a particular acquire operation.
      * @returns Acquire data.
      */
-    public async acquireNode(options: AcquireOptions = {}): Promise<PendingAcquire> {
+    public getAcquireDataSnapshot(): AcquireData {
+        return JSON.parse(JSON.stringify(this.acquireData));
+    }
+
+    public async acquireNode(options: AcquireOptions = {}, opRef?: string): Promise<PendingAcquire> {
         // Use provided host or select a host randomly.
         const hostAddress = options.host || await this.decideHost(options.preferredHosts);
         // Choose the lease offer
@@ -231,7 +235,9 @@ class EvernodeContext {
             leaseOfferIdx: leaseOffer.index,
             refId: res.hash,
             messageKey: messageKey,
-            acquireSentOnLcl: this.hpContext.lclSeqNo
+            acquireSentOnLcl: this.hpContext.lclSeqNo,
+            opRef,
+            acquireLedgerCap: res.LastLedgerSequence ?? res.lastLedgerSequence,
         };
 
         // Record as a acquire transaction.
