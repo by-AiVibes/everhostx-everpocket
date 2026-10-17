@@ -11,7 +11,7 @@ const { DIST } = require('./lib/env');
 const { repoLine } = require('./lib/sites');
 
 const CHILD = path.join(__dirname, 'lib', 'vote-crash-node.js');
-const CHILD_TIMEOUT_MS = 10000;
+const CHILD_TIMEOUT_MS = 30 * 60 * 1000;
 
 function waitForExit(child) {
     return new Promise((resolve, reject) => {

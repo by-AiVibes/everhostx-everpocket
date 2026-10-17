@@ -1,14 +1,19 @@
 'use strict';
+// A value export or public member must be reachable from the frozen public API
+// or from another src caller. `void f` and export specifiers are not callers.
+// Test-only names are rejected even when something calls them.
 const fs = require('fs');
 const path = require('path');
 const ts = require('typescript');
 const { DIST, SRC } = require('./env');
 const { walkTs, relSrc } = require('./src-walk');
-const { PUBLIC_EXPORTS, PUBLIC_MEMBERS } = require('./public-surface');
+const { assertSrcTree } = require('./src-assert');
+const { PUBLIC_EXPORTS, PUBLIC_MEMBERS, PUBLIC_VALUE_EXPORTS } = require('./public-surface');
 
 const BANNED_MEMBER = /^(?:__|set[A-Za-z0-9]*For(?:Test|Testing)$)/;
 const SKIP_STATIC = new Set(['length', 'name', 'prototype', 'caller', 'arguments']);
-const VALUE_FLAGS = ts.SymbolFlags.Function | ts.SymbolFlags.Class | ts.SymbolFlags.Variable | ts.SymbolFlags.Enum;
+const VALUE_FLAGS = ts.SymbolFlags.Function | ts.SymbolFlags.Class | ts.SymbolFlags.Variable
+    | ts.SymbolFlags.Enum | ts.SymbolFlags.ValueModule;
 
 function compilerOptions() {
     return {
@@ -19,6 +24,15 @@ function compilerOptions() {
     };
 }
 
+function isBannedMember(name) {
+    return !!name && (name.startsWith('__') || name.endsWith('ForObservation') || BANNED_MEMBER.test(name));
+}
+
+function inSrc(fileName) {
+    const rel = path.relative(SRC, fileName);
+    return rel && !rel.startsWith('..') && !path.isAbsolute(rel) && !fileName.endsWith('.d.ts');
+}
+
 function programOf(files) {
     return ts.createProgram(files, compilerOptions());
 }
@@ -26,7 +40,7 @@ function programOf(files) {
 function resolveAlias(checker, symbol) {
     let current = symbol;
     const seen = new Set();
-    while (current.flags & ts.SymbolFlags.Alias && !seen.has(current)) {
+    while (current && (current.flags & ts.SymbolFlags.Alias) && !seen.has(current)) {
         seen.add(current);
         const next = checker.getAliasedSymbol(current);
         if (!next || next === current)
@@ -36,84 +50,320 @@ function resolveAlias(checker, symbol) {
     return current;
 }
 
-function isValueSymbol(checker, symbol) {
-    return !!(resolveAlias(checker, symbol).flags & VALUE_FLAGS);
+function isValueSymbol(symbol) {
+    return !!(symbol && (symbol.flags & VALUE_FLAGS));
 }
 
-function declarationName(symbol) {
-    for (const declaration of symbol.getDeclarations() || []) {
-        if (declaration.name && ts.isIdentifier(declaration.name))
-            return { source: declaration.getSourceFile(), node: declaration.name };
+function nodeKey(node) {
+    const source = node.getSourceFile();
+    return `${source.fileName}:${node.getStart(source)}`;
+}
+
+function topKey(source) {
+    return `top:${source.fileName}`;
+}
+
+function classNameOf(node) {
+    const parent = node.parent;
+    if (parent && ts.isClassDeclaration(parent) && parent.name)
+        return parent.name.text;
+    return '';
+}
+
+function memberNameOf(node) {
+    if (ts.isConstructorDeclaration(node))
+        return 'constructor';
+    if (node.name && (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) || ts.isPrivateIdentifier(node.name)))
+        return node.name.text;
+    return '';
+}
+
+function inHeritage(node) {
+    let current = node;
+    while (current) {
+        if (ts.isHeritageClause(current))
+            return true;
+        current = current.parent;
     }
-    const declaration = (symbol.getDeclarations() || [])[0];
-    if (!declaration)
-        return null;
-    return { source: declaration.getSourceFile(), node: declaration };
+    return false;
 }
 
-function formatDecl(located, suffix) {
-    const start = located.node.getStart(located.source);
-    const { line } = located.source.getLineAndCharacterOfPosition(start);
-    const rel = relSrc(located.source.fileName);
-    return `${rel}:${line + 1}: ${suffix}`;
-}
-
-let serviceCache = null;
-
-function languageService(files) {
-    if (serviceCache)
-        return serviceCache;
-    const versions = new Map(files.map((file) => [file, '0']));
-    const host = {
-        getScriptFileNames: () => files,
-        getScriptVersion: (file) => versions.get(file) || '0',
-        getScriptSnapshot: (file) => {
-            if (!fs.existsSync(file))
-                return undefined;
-            return ts.ScriptSnapshot.fromString(fs.readFileSync(file, 'utf8'));
-        },
-        getCurrentDirectory: () => path.resolve(SRC, '..'),
-        getCompilationSettings: () => compilerOptions(),
-        getDefaultLibFileName: (options) => ts.getDefaultLibFilePath(options),
-        fileExists: ts.sys.fileExists,
-        readFile: ts.sys.readFile,
-        readDirectory: ts.sys.readDirectory,
-        directoryExists: ts.sys.directoryExists,
-        getDirectories: ts.sys.getDirectories,
-    };
-    serviceCache = ts.createLanguageService(host);
-    return serviceCache;
-}
-
-function hasSrcCaller(files, located) {
-    const start = located.node.getStart(located.source);
-    const declFile = path.resolve(located.source.fileName);
-    const refs = languageService(files).getReferencesAtPosition(located.source.fileName, start) || [];
-    return refs.some((ref) => {
-        if (ref.isDefinition)
+function isDirectVoidOperand(node) {
+    let current = node;
+    while (current && current.parent) {
+        if (ts.isFunctionLike(current))
             return false;
-        const sameDeclaration = path.resolve(ref.fileName) === declFile && ref.textSpan.start === start;
-        if (sameDeclaration)
-            return false;
-        return ref.fileName.includes(`${path.sep}src${path.sep}`);
-    });
+        if (ts.isVoidExpression(current.parent) && current.parent.expression === current)
+            return true;
+        current = current.parent;
+    }
+    return false;
 }
 
-function isBannedMember(name) {
-    return name.startsWith('__') || BANNED_MEMBER.test(name);
+function isSkippedUse(node) {
+    if (inHeritage(node))
+        return false;
+    if (isDirectVoidOperand(node))
+        return true;
+    let current = node;
+    while (current) {
+        if (ts.isImportDeclaration(current) || ts.isExportDeclaration(current) || ts.isExportAssignment(current)
+            || ts.isImportEqualsDeclaration(current) || ts.isTypeNode(current) || ts.isInterfaceDeclaration(current)
+            || ts.isTypeAliasDeclaration(current))
+            return true;
+        current = current.parent;
+    }
+    return false;
+}
+
+function isDeclarationName(node) {
+    const parent = node.parent;
+    if (!parent || parent.name !== node)
+        return false;
+    return ts.isFunctionLike(parent)
+        || ts.isClassDeclaration(parent)
+        || ts.isClassExpression(parent)
+        || ts.isVariableDeclaration(parent)
+        || ts.isParameter(parent)
+        || ts.isPropertyDeclaration(parent)
+        || ts.isModuleDeclaration(parent)
+        || ts.isEnumDeclaration(parent)
+        || ts.isEnumMember(parent)
+        || ts.isInterfaceDeclaration(parent)
+        || ts.isTypeAliasDeclaration(parent)
+        || ts.isBindingElement(parent)
+        || ts.isImportSpecifier(parent)
+        || ts.isExportSpecifier(parent)
+        || ts.isNamespaceImport(parent)
+        || ts.isImportClause(parent);
+}
+
+function enclosingKey(node) {
+    let current = node.parent;
+    while (current) {
+        if (ts.isFunctionLike(current) || ts.isClassStaticBlockDeclaration(current))
+            return nodeKey(current);
+        current = current.parent;
+    }
+    return topKey(node.getSourceFile());
+}
+
+function declarationKey(decl) {
+    if (ts.isFunctionLike(decl) || ts.isClassDeclaration(decl) || ts.isClassExpression(decl)
+        || ts.isVariableDeclaration(decl) || ts.isEnumDeclaration(decl) || ts.isEnumMember(decl)
+        || ts.isModuleDeclaration(decl) || ts.isPropertyDeclaration(decl) || ts.isBindingElement(decl))
+        return nodeKey(decl);
+    return enclosingKey(decl);
+}
+
+function analyze(files) {
+    const program = programOf(files.filter((file) => !file.endsWith('.d.ts')));
+    const checker = program.getTypeChecker();
+    const edges = [];
+    const memberUses = new Set();
+    const containers = new Map();
+    const bodies = new Map();
+
+    function remember(key, info) {
+        if (!containers.has(key))
+            containers.set(key, info);
+    }
+
+    function addEdge(from, to, memberKey) {
+        if (!from || !to || from === to)
+            return;
+        edges.push({ from, to });
+        if (memberKey)
+            memberUses.add(memberKey);
+    }
+
+    for (const source of program.getSourceFiles()) {
+        if (!inSrc(source.fileName))
+            continue;
+        remember(topKey(source), { root: true });
+        function visit(node) {
+            if (ts.isFunctionLike(node) || ts.isClassStaticBlockDeclaration(node)) {
+                const key = nodeKey(node);
+                const className = classNameOf(node);
+                const memberName = memberNameOf(node);
+                const memberKey = className && memberName ? `${className}.${memberName}` : '';
+                const exportName = ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)
+                    ? (node.name && node.name.text) : '';
+                const root = key.startsWith('top:')
+                    || (memberKey && PUBLIC_MEMBERS.has(memberKey))
+                    || (memberName === 'constructor' && PUBLIC_EXPORTS.has(className))
+                    || (exportName && PUBLIC_EXPORTS.has(exportName));
+                remember(key, { root, memberKey, exportName, className, node, source });
+            }
+            if (ts.isClassDeclaration(node) && node.name) {
+                const key = nodeKey(node);
+                remember(key, {
+                    root: PUBLIC_EXPORTS.has(node.name.text),
+                    exportName: node.name.text,
+                    node,
+                    source,
+                });
+            }
+            if (ts.isVariableDeclaration(node) && node.initializer && ts.isFunctionLike(node.initializer))
+                bodies.set(nodeKey(node), nodeKey(node.initializer));
+            if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && node.parent)
+                addEdge(enclosingKey(node.parent), nodeKey(node), '');
+            if ((ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) && !isDeclarationName(node) && !isSkippedUse(node)) {
+                const symbol = checker.getSymbolAtLocation(node);
+                const resolved = symbol ? resolveAlias(checker, symbol) : null;
+                const decl = resolved && (resolved.getDeclarations() || []).find((item) => inSrc(item.getSourceFile().fileName));
+                if (decl) {
+                    let target = decl;
+                    if (ts.isVariableDeclaration(decl) && decl.initializer && ts.isFunctionLike(decl.initializer))
+                        target = decl;
+                    const targetKey = declarationKey(decl);
+                    const className = classNameOf(decl);
+                    const memberName = memberNameOf(decl);
+                    let memberKey = className && memberName ? `${className}.${memberName}` : '';
+                    if (!memberKey && ts.isClassDeclaration(decl) && decl.name && node.parent && ts.isNewExpression(node.parent))
+                        memberKey = `${decl.name.text}.constructor`;
+                    addEdge(enclosingKey(node), targetKey, memberKey);
+                    if (ts.isVariableDeclaration(decl) && decl.initializer && ts.isFunctionLike(decl.initializer))
+                        bodies.set(nodeKey(decl), nodeKey(decl.initializer));
+                }
+            }
+            ts.forEachChild(node, visit);
+        }
+        visit(source);
+    }
+
+    const live = new Set();
+    for (const [key, info] of containers) {
+        if (info.root)
+            live.add(key);
+    }
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const key of [...live]) {
+            const body = bodies.get(key);
+            if (body && !live.has(body)) {
+                live.add(body);
+                changed = true;
+            }
+        }
+        for (const edge of edges) {
+            if (live.has(edge.from) && !live.has(edge.to)) {
+                live.add(edge.to);
+                changed = true;
+            }
+        }
+    }
+    return { program, checker, live, memberUses, containers, edges };
+}
+
+function sourceFiles(program) {
+    return program.getSourceFiles();
+}
+
+function formatAt(source, node, suffix) {
+    const start = node.getStart(source);
+    const { line } = source.getLineAndCharacterOfPosition(start);
+    return `${relSrc(source.fileName)}:${line + 1}: ${suffix}`;
+}
+
+function exportedSymbols(checker, source) {
+    const moduleSymbol = checker.getSymbolAtLocation(source);
+    if (!moduleSymbol)
+        return [];
+    const found = [];
+    for (const exported of checker.getExportsOfModule(moduleSymbol)) {
+        const resolved = resolveAlias(checker, exported);
+        if (!resolved || !isValueSymbol(resolved))
+            continue;
+        const decl = (resolved.getDeclarations() || []).find((item) => inSrc(item.getSourceFile().fileName));
+        if (!decl)
+            continue;
+        const aliasDecl = (exported.getDeclarations() || []).find((item) => ts.isExportSpecifier(item) && inSrc(item.getSourceFile().fileName));
+        found.push({
+            name: resolved.getName() === 'default' ? exported.getName() : resolved.getName(),
+            resolvedName: resolved.getName(),
+            exportName: exported.getName(),
+            decl,
+            source: decl.getSourceFile(),
+            reexport: aliasDecl && aliasDecl.getSourceFile() !== decl.getSourceFile() ? aliasDecl : null,
+        });
+    }
+    return found;
+}
+
+function deadExports() {
+    const files = assertSrcTree();
+    const { program, checker, live } = analyze(files);
+    const hits = [];
+    const seen = new Set();
+    for (const source of sourceFiles(program)) {
+        if (!inSrc(source.fileName))
+            continue;
+        for (const item of exportedSymbols(checker, source)) {
+            const valueKey = `${relSrc(item.source.fileName)}:${item.resolvedName === 'default' ? item.exportName : item.resolvedName}`;
+            if (PUBLIC_EXPORTS.has(item.resolvedName) || PUBLIC_EXPORTS.has(item.name) || PUBLIC_EXPORTS.has(item.exportName)
+                || PUBLIC_VALUE_EXPORTS.has(valueKey))
+                continue;
+            const key = nodeKey(item.decl);
+            if (live.has(key))
+                continue;
+            const label = item.resolvedName === 'default' ? item.exportName : item.resolvedName;
+            const sites = [formatAt(item.source, item.decl, `export ${label} has no src caller and is not on the public API allowlist`)];
+            if (item.reexport)
+                sites.push(formatAt(item.reexport.getSourceFile(), item.reexport, `export ${item.exportName} has no src caller and is not on the public API allowlist`));
+            for (const text of sites) {
+                if (!seen.has(text)) {
+                    seen.add(text);
+                    hits.push(text);
+                }
+            }
+        }
+    }
+    return hits;
+}
+
+function semanticMembers(program) {
+    const found = [];
+    for (const source of program.getSourceFiles()) {
+        if (!inSrc(source.fileName))
+            continue;
+        function visit(node) {
+            if (ts.isClassDeclaration(node) && node.name) {
+                const cls = node.name.text;
+                for (const member of node.members) {
+                    if (member.name && ts.isPrivateIdentifier(member.name))
+                        continue;
+                    const mods = ts.getCombinedModifierFlags(member);
+                    if (mods & ts.ModifierFlags.Private || mods & ts.ModifierFlags.Protected)
+                        continue;
+                    const name = memberNameOf(member);
+                    if (!name)
+                        continue;
+                    const nameNode = member.name && (ts.isIdentifier(member.name) || ts.isPrivateIdentifier(member.name))
+                        ? member.name
+                        : member;
+                    found.push({ cls, name, source, node: nameNode, member });
+                }
+            }
+            ts.forEachChild(node, visit);
+        }
+        visit(source);
+    }
+    return found;
 }
 
 function loadRuntimeExports() {
     const entry = path.join(DIST, 'index.js');
     if (!fs.existsSync(entry))
-        return { keys: [], classes: [] };
+        return [];
     const pkg = require(entry);
     const classes = [];
     for (const [key, value] of Object.entries(pkg)) {
         if (typeof value === 'function')
             classes.push({ cls: value.name || key, ctor: value });
     }
-    return { keys: Object.keys(pkg), classes };
+    return classes;
 }
 
 function runtimeMemberNames(ctor) {
@@ -129,70 +379,9 @@ function runtimeMemberNames(ctor) {
     return names;
 }
 
-function deadExports() {
-    const files = walkTs();
-    const program = programOf(files);
-    const checker = program.getTypeChecker();
-    const index = program.getSourceFile(path.join(SRC, 'index.ts'));
-    const moduleSymbol = checker.getSymbolAtLocation(index);
-    const exported = checker.getExportsOfModule(moduleSymbol);
-    const runtime = loadRuntimeExports();
-    const names = new Set([
-        ...exported.filter((symbol) => isValueSymbol(checker, symbol)).map((symbol) => symbol.getName()),
-        ...runtime.keys,
-    ]);
-    const hits = [];
-    for (const name of names) {
-        if (PUBLIC_EXPORTS.has(name))
-            continue;
-        const symbol = exported.find((item) => item.getName() === name);
-        const located = symbol ? declarationName(symbol) : null;
-        const called = located ? hasSrcCaller(files, located) : false;
-        if (called)
-            continue;
-        if (located)
-            hits.push(formatDecl(located, `export ${name} has no src caller and is not on the public API allowlist`));
-        else
-            hits.push(`index.ts:1: export ${name} has no src caller and is not on the public API allowlist`);
-    }
-    return hits;
-}
-
-function publicMembers(program) {
-    const found = [];
-    for (const source of program.getSourceFiles()) {
-        if (!source.fileName.includes(`${path.sep}src${path.sep}`))
-            continue;
-        function visit(node) {
-            if (ts.isClassDeclaration(node) && node.name) {
-                const cls = node.name.text;
-                for (const member of node.members) {
-                    if (member.name && ts.isPrivateIdentifier(member.name))
-                        continue;
-                    const mods = ts.getCombinedModifierFlags(member);
-                    if (mods & ts.ModifierFlags.Private || mods & ts.ModifierFlags.Protected)
-                        continue;
-                    let name = null;
-                    if (member.kind === ts.SyntaxKind.Constructor)
-                        name = 'constructor';
-                    else if (member.name && (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)))
-                        name = member.name.text;
-                    if (!name)
-                        continue;
-                    const nameNode = member.name && ts.isIdentifier(member.name) ? member.name : member;
-                    found.push({ cls, name, source, node: nameNode });
-                }
-            }
-            ts.forEachChild(node, visit);
-        }
-        visit(source);
-    }
-    return found;
-}
-
 function deadMembers() {
-    const files = walkTs();
-    const program = programOf(files);
+    const files = assertSrcTree();
+    const { program, memberUses } = analyze(files);
     const hits = [];
     const seen = new Set();
     function add(text) {
@@ -201,33 +390,31 @@ function deadMembers() {
             hits.push(text);
         }
     }
-    for (const member of publicMembers(program)) {
+    const members = semanticMembers(program);
+    for (const member of members) {
         const key = `${member.cls}.${member.name}`;
         const banned = isBannedMember(member.name);
         const allowed = PUBLIC_MEMBERS.has(key);
-        if (!banned && allowed)
-            continue;
-        const located = { source: member.source, node: member.node };
-        if (!banned && hasSrcCaller(files, located))
+        const called = memberUses.has(key);
+        if (!banned && (called || allowed))
             continue;
         const why = banned
             ? `test-only member ${member.name}`
             : `public member ${member.name} has no src caller and is not on the public API allowlist`;
-        add(formatDecl(located, why));
+        add(formatAt(member.source, member.node, why));
     }
-    const runtime = loadRuntimeExports();
-    for (const { cls, ctor } of runtime.classes) {
+    for (const { cls, ctor } of loadRuntimeExports()) {
         for (const name of runtimeMemberNames(ctor)) {
             const key = `${cls}.${name}`;
-            if (!isBannedMember(name) && PUBLIC_MEMBERS.has(key))
+            const banned = isBannedMember(name);
+            const allowed = PUBLIC_MEMBERS.has(key);
+            const called = memberUses.has(key);
+            if (!banned && (called || allowed))
                 continue;
-            const semantic = publicMembers(program).find((member) => member.cls === cls && member.name === name);
-            if (semantic) {
-                add(formatDecl({ source: semantic.source, node: semantic.node }, `runtime member ${name}`));
+            const semantic = members.find((member) => member.cls === cls && member.name === name);
+            if (semantic)
                 continue;
-            }
-            if (isBannedMember(name) || !PUBLIC_MEMBERS.has(key))
-                add(`${cls}.ts:1: runtime member ${cls}.${name} is test-only or not on the public API allowlist`);
+            add(`${cls}.ts:1: runtime member ${cls}.${name} is test-only or not on the public API allowlist`);
         }
     }
     return hits;

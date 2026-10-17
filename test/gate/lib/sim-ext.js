@@ -12,15 +12,17 @@ const { landedPerOp } = require('./sim/run');
 
 const NODE_IDS = ['A', 'B', 'C', 'D', 'E'];
 const ANCHOR_LEDGER = 10000;
-const ROUND_CHILD_TIMEOUT_MS = 30000;
 const HASH = (value) => crypto.createHash('sha256').update(value).digest('hex').slice(0, 10);
 
-function writeNodeHome(root, id, ops, nodes) {
+function writeNodeHome(root, id, ops, nodes, operationState) {
     const dir = path.join(root, id);
     fs.mkdirSync(dir);
     fs.writeFileSync(path.join(dir, 'acquires.json'), JSON.stringify({ acquiredNodes: [], pendingAcquires: [] }));
     fs.writeFileSync(path.join(dir, 'cluster.json'), JSON.stringify({ initialized: true, nodes, pendingNodes: [] }));
-    fs.writeFileSync(path.join(dir, 'operations.json'), JSON.stringify({ operations: ops }));
+    fs.writeFileSync(path.join(dir, 'operations.json'), JSON.stringify({
+        operations: ops,
+        ...(operationState || {}),
+    }));
     fs.writeFileSync(path.join(dir, 'cfg.json'), JSON.stringify({
         unl: NODE_IDS,
         max_input_ledger_offset: 10,
@@ -73,12 +75,6 @@ async function runRound(root, dirs, ledgerFile, ledger, round, options, ids) {
         ], { env: { ...process.env, DIST } });
     }
     await new Promise((done) => {
-        const timer = setTimeout(() => {
-            for (const id of ids)
-                finish(res, id, { aborted: true, err: 'timeout', voteUsed: false, f: ['', '', ''] }, ids, done);
-            for (const id of ids)
-                kids[id].kill('SIGKILL');
-        }, ROUND_CHILD_TIMEOUT_MS);
         for (const id of ids) {
             kids[id].on('error', () => {
                 finish(res, id, { aborted: true, err: 'fork error', voteUsed: false, f: ['', '', ''] }, ids, done);
@@ -98,13 +94,6 @@ async function runRound(root, dirs, ledgerFile, ledger, round, options, ids) {
                 }
             });
         }
-        const started = Date.now();
-        const wrap = done;
-        done = () => {
-            if (Date.now() >= started)
-                clearTimeout(timer);
-            wrap();
-        };
     });
     for (const id of ids) {
         if (kids[id] && kids[id].exitCode === null)
@@ -151,7 +140,7 @@ async function scenExt(name, options) {
         ledger.hash[index] = crypto.createHash('sha256').update(`ledger${index}`).digest('hex').toUpperCase();
     const dirs = {};
     for (const id of ids)
-        dirs[id] = writeNodeHome(root, id, options.ops, options.nodes);
+        dirs[id] = writeNodeHome(root, id, options.ops, options.nodes, options.operationState);
     let divergentRounds = 0;
     let first = null;
     let aborts = 0;

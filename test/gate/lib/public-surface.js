@@ -12,6 +12,12 @@ const PUBLIC_EXPORTS = new Set([
     "VoteContext",
     "XrplContext"
 ]);
+// Exported values with no in-src caller that are still part of the library surface.
+const PUBLIC_VALUE_EXPORTS = new Set([
+    "helpers/logger.ts:success",
+    "helpers/logger.ts:warn",
+    "ledger/xahauConstants.ts:XAHAU_NETWORK_ID",
+]);
 const PUBLIC_MEMBERS = new Set([
     "AllVoteElector.constructor",
     "AllVoteElector.election",
@@ -30,7 +36,10 @@ const PUBLIC_MEMBERS = new Set([
     "ClusterContext.getClusterUnlNodes",
     "ClusterContext.getPendingNodes",
     "ClusterContext.hpContext",
+    "ClusterContext.ingestUserInput",
     "ClusterContext.init",
+    "ClusterContext.isRoundAborted",
+    "ClusterContext.processConsensusUserInputs",
     "ClusterContext.removeNode",
     "ClusterContext.totalCount",
     "ClusterContext.voteContext",
@@ -64,6 +73,7 @@ const PUBLIC_MEMBERS = new Set([
     "EvernodeContext.decodeLeaseTokenUri",
     "EvernodeContext.deinit",
     "EvernodeContext.extendSubmit",
+    "EvernodeContext.scheduleObservationSubmitOutOfBand",
     "EvernodeContext.getAcquiredNodes",
     "EvernodeContext.getCurMoment",
     "EvernodeContext.getEvernodeConfig",
@@ -140,6 +150,9 @@ const PUBLIC_MEMBERS = new Set([
     "XrplContext.getSequence",
     "XrplContext.getSignerList",
     "XrplContext.getTransactionSubmissionInfo",
+    "XrplContext.getAccountSequenceAt",
+    "XrplContext.getSignerListAt",
+    "XrplContext.getTxAt",
     "XrplContext.getTransactions",
     "XrplContext.getValidatedTransaction",
     "XrplContext.getValidatedTransactions",
@@ -158,4 +171,4 @@ const PUBLIC_MEMBERS = new Set([
     "XrplContext.xrplAcc",
     "XrplContext.xrplApi"
 ]);
-module.exports = { PUBLIC_EXPORTS, PUBLIC_MEMBERS };
+module.exports = { PUBLIC_EXPORTS, PUBLIC_MEMBERS, PUBLIC_VALUE_EXPORTS };

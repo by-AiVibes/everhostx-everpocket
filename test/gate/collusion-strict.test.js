@@ -46,7 +46,7 @@ function assertColludeDoesNotComplete(site) {
         ({ quorumExtendCompletesOp } = requireDist('cluster/ExtendPinning'));
     }
     catch (error) {
-        assert.fail(`${site}: op C dequeued without a landed tx: quorumExtendCompletesOp missing (${error.code || error.message})`);
+        assert.fail(`${site}: quorumExtendCompletesOp missing (${error.code || error.message})`);
     }
     const operation = colludeOperation();
     const completed = quorumExtendCompletesOp({
@@ -71,7 +71,7 @@ const pending = scenExt('COLLUDE2-STRICT', {
     modes: (id) => (id === 'A' || id === 'B' ? 'collude' : 'ok'),
 });
 
-test('2/5 collude: op C is not dequeued without a landed tx', { timeout: 600000 }, async () => {
+test('2/5 collude: op C stays queued unless a tx landed', async () => {
     const out = await pending;
     const site = quorumExtendSite();
     const landed = landedPerOp(out).C;
@@ -80,16 +80,19 @@ test('2/5 collude: op C is not dequeued without a landed tx', { timeout: 600000 
         queued || landed === 1,
         `${out.name}: op C dequeued without a landed tx at ${site}: opsLeft=${JSON.stringify(out.opsLeft)} landed[C]=${landed}`
     );
-    assertColludeDoesNotComplete(site);
 });
 
-test('2/5 collude: agreed extend hash is not COLLUDETX', { timeout: 600000 }, async () => {
+test('quorumExtendCompletesOp refuses a 2-node COLLUDETX', () => {
+    assertColludeDoesNotComplete(quorumExtendSite());
+});
+
+test('2/5 collude: agreed extend hash is not COLLUDETX', async () => {
     const out = await pending;
     const site = quorumExtendSite();
     const hash = out.agreedExtendResults && out.agreedExtendResults.C && out.agreedExtendResults.C.hash;
     assert.notEqual(hash, 'COLLUDETX', `${out.name}: ${site}: agreedExtendResults.C.hash !== 'COLLUDETX' (got ${hash})`);
 });
 
-test('2/5 collude: aborts == 0', { timeout: 600000 }, async () => {
+test('2/5 collude: aborts == 0', async () => {
     assertNoAborts(await pending);
 });

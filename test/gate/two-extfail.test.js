@@ -16,15 +16,20 @@ const pending = scen('twoExtfail', {
     modes: (id) => (id === 'D' || id === 'E' ? 'extfail' : 'ok'),
 });
 
-test('twoExtfail: D and E extfail, landed[C] == 1 and C is dequeued', { timeout: 600000 }, async () => {
+test('twoExtfail: D and E extfail, landed[C] == 1', async () => {
     const out = await pending;
     const site = extendSubmitSite();
     const landed = landedPerOp(out).C;
-    const queued = out.opsLeft.some((op) => op.includes(':C#'));
     assert.equal(landed, 1, `${site}: twoExtfail landed[C] == 1, got ${landed}; opsLeft=${JSON.stringify(out.opsLeft)}`);
+});
+
+test('twoExtfail: C is dequeued', async () => {
+    const out = await pending;
+    const site = extendSubmitSite();
+    const queued = out.opsLeft.some((op) => op.includes(':C#'));
     assert.equal(queued, false, `${site}: twoExtfail expected C dequeued, opsLeft=${JSON.stringify(out.opsLeft)}`);
 });
 
-test('twoExtfail: aborts == 0', { timeout: 600000 }, async () => {
+test('twoExtfail: aborts == 0', async () => {
     assertNoAborts(await pending);
 });
