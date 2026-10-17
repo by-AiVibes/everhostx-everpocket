@@ -170,6 +170,30 @@ class HotPocketContext {
     }
 
     /**
+     * Submit a contract input as this node's HotPocket user key (out-of-band observation path).
+     * Submission acceptance is awaited; contract state is unchanged until a later round ingests inputs.
+     */
+    public async submitContractInputRaw(message: string, nodes: Peer[]): Promise<void> {
+        return new Promise<void>(async (resolve, reject) => {
+            await this.#connectAndHandle(nodes, async () => {
+                const input = await this.hpClient.submitContractInput(message);
+                const statRes = await input.submissionStatus;
+                if (statRes.status != "accepted")
+                    throw new Error("Submission failed. reason: " + statRes.reason);
+            }, (data: any, error: any) => {
+                if (error)
+                    reject(error);
+                else
+                    resolve();
+                return;
+            }, { timeout: 60000 }).catch(e => {
+                reject(e);
+                return;
+            });
+        });
+    }
+
+    /**
      * Get the contract config.
      * @returns The contract config.
      */

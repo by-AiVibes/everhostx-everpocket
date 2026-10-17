@@ -1,0 +1,4 @@
+# Gate suite and acceptance doc changes need reviewer approval (Nox ruling).
+/test/gate/ @by-AiVibes
+/docs/acceptance.md @by-AiVibes
+/.github/CODEOWNERS @by-AiVibes

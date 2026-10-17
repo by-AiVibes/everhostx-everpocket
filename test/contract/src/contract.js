@@ -76,12 +76,13 @@ const testContract = async (contractCtx) => {
             for (const input of user.inputs) {
                 const buf = await contractCtx.users.read(input);
                 info("Received user input", buf.toString());
-                await clusterContext.feedUserMessage(user, buf);
+                await clusterContext.ingestUserInput(user, buf);
             }
             resolve();
         }));
     }
     await Promise.all(userHandlers);
+    await clusterContext.flushConsensusInputsForRound();
 
     if (!contractCtx.readonly) {
         const tests = [
@@ -113,6 +114,11 @@ const testContract = async (contractCtx) => {
             await evernodeContext.deinit();
             await clusterContext.deinit();
             await nomadContext.deinit();
+            const unlNodes = clusterContext.getClusterUnlNodes();
+            if (unlNodes?.length) {
+                const peers = unlNodes.map(n => new evp.Peer(n.domain, n.userPort));
+                evernodeContext.scheduleObservationSubmitOutOfBand(peers);
+            }
         }
     }
 }

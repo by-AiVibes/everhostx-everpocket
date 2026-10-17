@@ -61,21 +61,70 @@ export interface AddNodeOperation {
 export interface ExtendNodeOperation {
   nodePubkey: string;
   moments: number;
+  extendTxHash?: string;
+  extendLedgerCap?: number;
 }
 
 export interface RemoveNodeOperation {
   nodePubkey: string;
   force: boolean;
+  signerTxCap?: number;
 }
 
 export interface Operation {
   type: OperationType,
   ref: string,
-  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation
+  data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation,
+  attempt?: number;
+  nextAttemptLcl?: number;
+  createdLcl?: number;
+  /** Set when quorum shows the pinned sequence consumed by a different tx. */
+  extendHoldReason?: string;
+  /** Quorum-agreed submit identity already counted toward attempt (hash|lls|rc). */
+  quorumCountedSubmitKey?: string;
+  /** @deprecated migrated to attempt */
+  retryCount?: number;
+  /** @deprecated migrated to nextAttemptLcl */
+  nextRetryLcl?: number;
 }
 
 export interface OperationData {
-  operations: Operation[]
+  operations: Operation[];
+  /** Agreed Xahau ledger anchor; advances via consensus observation quorum (see docs/queue-agreed-state.md). */
+  anchorLedger?: number;
+  /** True when quorum agrees on validated index but not ledger hash (e.g. hash liar). */
+  anchorQuorumStalled?: boolean;
+  /** Quorum-agreed tenant sequence from observations (consumption when anchor quorum is stalled). */
+  observedTenantSequenceQuorum?: number;
+  agreedLedgerHash?: string;
+  agreedTenantSequence?: number;
+  agreedSignerListHash?: string;
+  agreedExtendResults?: Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }>;
+  nodeUserRegistrations?: Record<string, string>;
+  observationDedup?: Record<string, {
+    nonce: number;
+    observedLcl: number;
+    extendSubmitVote?: {
+      opRef: string;
+      hash: string;
+      lastLedgerSequence: number;
+      resultCode: string;
+    };
+  }>;
+  /** Tenant sequences for which a quorum-confirmed extend already landed; never resubmit at these. */
+  consumedTenantSequences?: number[];
+  /** Agreed extend tx fields pinned on first attempt (hash stable across retries). */
+  pinnedExtendTxs?: Record<string, {
+    tenantAddress: string;
+    sequence: number;
+    lastLedgerSequence: number;
+    fee: string;
+    host: string;
+    anchorLedger: number;
+    nodePubkey: string;
+    moments: number;
+    tokenId: string;
+  }>;
 }
 
 export enum ClusterMessageType {

@@ -2,6 +2,7 @@ import { VoteContext, XrplContext } from ".";
 import { AcquireData, AcquireOptions, AcquiredNode, Instance, LeaseURIInfo, PendingAcquire } from "../models/evernode";
 import * as evernode from 'evernode-js-client';
 import { Buffer } from 'buffer';
+import { randomBytes } from 'crypto';
 import { AllVoteElector } from "../vote/vote-electors";
 import { URIToken } from "../models";
 import * as fs from 'fs';
@@ -10,6 +11,9 @@ import { JSONHelpers } from "../utils";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
 import { error, log } from "../helpers/logger";
+import { Peer } from "../models";
+import { SubmittedTxObservation } from "../cluster/AnchorObservation";
+import { scheduleObservationSubmit, ObservationSidecarHooks } from "../observation/ObservationSidecar";
 import NumberHelpers from "../utils/helpers/NumberHelper";
 
 const TIMEOUT = 10000;
@@ -21,6 +25,7 @@ class EvernodeContext {
     private registryClient: any;
     private updatedData: boolean = false;
     private initialized: boolean = false;
+    private observationPendingSubmits: SubmittedTxObservation[] = [];
     public hpContext: HotPocketContext;
     public xrplContext: XrplContext;
     public voteContext: VoteContext;
@@ -48,28 +53,37 @@ class EvernodeContext {
         if (this.initialized)
             return;
 
-        await this.xrplContext.init();
+        await this.bootstrapForRound();
+        await this.finishRoundInit();
+        this.initialized = true;
+    }
 
-        try {
+    public async bootstrapForRound(): Promise<void> {
+        await this.xrplContext.bootstrapForRound();
+    }
+
+    public async finishRoundInit(): Promise<void> {
+        if (!this.registryClient) {
             this.registryClient = await evernode.HookClientFactory.create(evernode.HookTypes.registry);
             await this.registryClient.connect();
-
-            await this.#checkForCompletedAcquires();
-            this.initialized = true;
-        } catch (e) {
-            await this.deinit();
-            throw e;
         }
+        await this.#checkForCompletedAcquires();
+    }
+
+    public getAcquireDataSnapshot(): AcquireData {
+        return JSON.parse(JSON.stringify(this.acquireData));
     }
 
     /**
      * Deinitialize the context.
      */
-    public async deinit(): Promise<void> {
-        this.#persistAcquireData();
+    public async deinit(roundAborted: boolean = false): Promise<void> {
+        if (!roundAborted)
+            this.#persistAcquireData();
         if (this.registryClient)
             await this.registryClient.disconnect();
-        await this.xrplContext.deinit();
+        this.registryClient = null as any;
+        await this.xrplContext.deinit(roundAborted);
         this.initialized = false;
     }
 
@@ -356,8 +370,9 @@ class EvernodeContext {
         const tenantClient = new evernode.TenantClient(this.xrplContext.xrplAcc.address);
         await tenantClient.connect();
 
-        const seed = Buffer.from(this.hpContext.lclHash, "hex");
-        const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(hostAddress, { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messageKey }, { leaseOfferIndex: leaseOffer.index, iv: seed.slice(0, 16), ephemPrivateKey: seed.slice(0, 32) })
+        const iv = randomBytes(16);
+        const ephemPrivateKey = randomBytes(32);
+        const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(hostAddress, { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messageKey }, { leaseOfferIndex: leaseOffer.index, iv, ephemPrivateKey })
         await tenantClient.disconnect();
 
         return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
@@ -383,7 +398,36 @@ class EvernodeContext {
         const preparedAcquireTxn = await tenantClient.prepareExtendLeaseTransaction(hostAddress, ((uriInfo.leaseAmount * extension)).toString(), tokenID, options)
         await tenantClient.disconnect();
 
-        return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
+        const res = await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
+        this.#recordObservationPendingSubmit(options, res);
+        return res;
+    }
+
+    #recordObservationPendingSubmit(options: any, res: any): void {
+        if (!options?.extendOpRef || !res?.hash)
+            return;
+        const entry: SubmittedTxObservation = {
+            ref: options.extendOpRef,
+            hash: res.hash,
+            lastLedgerSequence: options.txSubmitInfo && options.txSubmitInfo.maxLedgerSequence !== undefined
+                ? options.txSubmitInfo.maxLedgerSequence
+                : 0,
+            resultCode: res.code === 'tesSUCCESS' ? 'tesSUCCESS' : (res.code || 'unknown'),
+        };
+        this.observationPendingSubmits.push(entry);
+    }
+
+    /**
+     * Schedule out-of-band observation submit (not awaited; does not affect contract round).
+     */
+    public scheduleObservationSubmitOutOfBand(peers: Peer[], hooks?: ObservationSidecarHooks): void {
+        scheduleObservationSubmit(
+            this.hpContext,
+            this.xrplContext,
+            peers,
+            this.observationPendingSubmits,
+            hooks,
+        );
     }
 
     /**

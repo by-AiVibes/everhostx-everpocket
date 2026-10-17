@@ -9,6 +9,10 @@ import VoteContext from './VoteContext';
 import { JSONHelpers } from '../utils';
 import { error, log } from '../helpers/logger';
 import NumberHelpers from '../utils/helpers/NumberHelper';
+import { XahauLedgerBackend } from '../ledger/XahauLedgerBackend';
+import { EVERNODE_XAHAU_NETWORK_KEY } from '../ledger/xahauConstants';
+import { FrozenRoundSnapshot } from '../cluster/RoundSnapshot';
+import { readFeeCeiling, readTenantSequence, buildLastLedgerSequenceFromSnapshot } from '../cluster/DeterministicTx';
 
 const TIMEOUT = 10000;
 const TRANSACTION_VOTE_THRESHOLD = 0.5;
@@ -25,6 +29,8 @@ class XrplContext {
     public multiSigner!: MultiSigner;
     public voteContext: VoteContext;
     public contextOptions: XrplOptions;
+    /** Pinned-index Xahau reads; tests inject a backend from test/. */
+    public xahauLedger: XahauLedgerBackend | null = null;
 
     public constructor(hpContext: HotPocketContext, address: string, secret: string | null = null, options: XrplOptions = {}) {
         this.hpContext = hpContext;
@@ -49,7 +55,16 @@ class XrplContext {
         if (this.initialized)
             return;
 
-        await evernode.Defaults.useNetwork(this.contextOptions.network || "mainnet");
+        await this.bootstrapForRound();
+        await this.reconcileValidatedTransactions(0);
+        this.initialized = true;
+    }
+
+    public async bootstrapForRound(): Promise<void> {
+        if (this.xrplApi?.isConnected?.())
+            return;
+
+        await evernode.Defaults.useNetwork(this.contextOptions.network || EVERNODE_XAHAU_NETWORK_KEY);
         this.xrplApi = this.xrplApi || new evernode.XrplApi(this.contextOptions.rippleServer, { autoReconnect: false, ...this.contextOptions });
         evernode.Defaults.set({
             xrplApi: this.xrplApi
@@ -59,17 +74,29 @@ class XrplContext {
 
         await this.xrplApi.connect();
         await this.loadSignerList();
+    }
+
+    public async reconcileValidatedTransactions(_anchorLedger: number): Promise<void> {
         this.#checkSignerValidity();
         await this.#checkForValidateTransactions();
-        this.initialized = true;
+    }
+
+    public deriveTxSubmitInfo(snap: FrozenRoundSnapshot): TransactionSubmissionInfo {
+        return {
+            sequence: readTenantSequence(snap),
+            maxLedgerSequence: buildLastLedgerSequenceFromSnapshot(snap),
+            fee: readFeeCeiling(snap),
+        };
     }
 
     /**
      * Deinitialize the xrpl context.
      */
-    public async deinit(): Promise<void> {
-        this.#persistTransactionData();
-        await this.xrplApi.disconnect();
+    public async deinit(roundAborted: boolean = false): Promise<void> {
+        if (!roundAborted)
+            this.#persistTransactionData();
+        if (this.xrplApi?.isConnected())
+            await this.xrplApi.disconnect();
     }
 
     /**
@@ -297,7 +324,13 @@ class XrplContext {
         if (!this.signerListInfo || !signerCount)
             throw `${transaction.TransactionType} | Could not get signer list`;
 
-        transaction.Fee = `${Number(transaction.Fee) * (signerCount + 2)}`;
+        if (options?.txSubmitInfo) {
+            if (!txSubmitInfo.fee)
+                throw new Error(`${transaction.TransactionType} | Missing fee in txSubmitInfo`);
+            transaction.Fee = txSubmitInfo.fee;
+        } else {
+            transaction.Fee = `${Number(transaction.Fee) * (signerCount + 2)}`;
+        }
 
         const elector = new AllVoteElector(signerCount, options?.voteElectorOptions?.timeout || TIMEOUT);
         const electionName = `sign${this.voteContext.getUniqueNumber()}`;
@@ -604,6 +637,83 @@ class XrplContext {
      */
     public getSignerList(): SignerListInfo | null {
         return this.signerListInfo;
+    }
+
+    public getValidatedLedgerIndex(): number {
+        if (this.xahauLedger)
+            return this.xahauLedger.getValidatedLedgerIndex();
+        if (this.xrplApi && this.xrplApi.ledgerIndex !== undefined)
+            return this.xrplApi.ledgerIndex;
+        return 0;
+    }
+
+    public setXahauLedgerBackend(backend: XahauLedgerBackend | null): void {
+        this.xahauLedger = backend;
+    }
+
+    public async getTxAt(hash: string, ledgerIndex: number): Promise<TransactionInfo | null> {
+        if (ledgerIndex > 0 && this.getValidatedLedgerIndex() < ledgerIndex)
+            throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
+        if (this.xahauLedger)
+            return await this.xahauLedger.getTxAt(hash, ledgerIndex);
+        throw new Error(`Pinned Xahau read required for getTxAt(${hash}, ${ledgerIndex})`);
+    }
+
+    public async getSignerListAt(ledgerIndex: number): Promise<SignerListInfo | null> {
+        if (ledgerIndex > 0 && this.getValidatedLedgerIndex() < ledgerIndex)
+            throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
+        if (this.xahauLedger)
+            return await this.xahauLedger.getSignerListAt(ledgerIndex);
+        throw new Error(`Pinned Xahau read required for getSignerListAt(${ledgerIndex})`);
+    }
+
+    public async getAccountSequenceAt(account: string, ledgerIndex: number): Promise<number> {
+        if (ledgerIndex > 0 && this.getValidatedLedgerIndex() < ledgerIndex)
+            throw new Error(`Xahau ledger lag: validated ${this.getValidatedLedgerIndex()} < pinned ${ledgerIndex}`);
+        if (this.xahauLedger)
+            return await this.xahauLedger.getAccountSequenceAt(account, ledgerIndex);
+        throw new Error(`Pinned Xahau read required for getAccountSequenceAt(${account}, ${ledgerIndex})`);
+    }
+
+    public async getLedgerHashAt(ledgerIndex: number): Promise<string | null> {
+        if (ledgerIndex <= 0)
+            return null;
+        if (this.getValidatedLedgerIndex() < ledgerIndex)
+            return null;
+        if (this.xahauLedger?.getLedgerHashAt)
+            return await this.xahauLedger.getLedgerHashAt(ledgerIndex);
+        if (!this.xrplApi?.request)
+            return null;
+        try {
+            const res = await this.xrplApi.request({ command: 'ledger', ledger_index: ledgerIndex });
+            const result = res && res.result ? res.result : res;
+            const ledger = result && result.ledger ? result.ledger : null;
+            if (ledger && ledger.ledger_hash)
+                return ledger.ledger_hash;
+            return null;
+        } catch {
+            return null;
+        }
+    }
+
+    public async getSignerListAtForObservation(ledgerIndex: number): Promise<SignerListInfo | null> {
+        if (ledgerIndex <= 0 || this.getValidatedLedgerIndex() < ledgerIndex)
+            return null;
+        try {
+            return await this.getSignerListAt(ledgerIndex);
+        } catch {
+            return null;
+        }
+    }
+
+    public async getAccountSequenceAtForObservation(account: string, ledgerIndex: number): Promise<number | null> {
+        if (ledgerIndex <= 0 || this.getValidatedLedgerIndex() < ledgerIndex)
+            return null;
+        try {
+            return await this.getAccountSequenceAt(account, ledgerIndex);
+        } catch {
+            return null;
+        }
     }
 
     /**
