@@ -191,6 +191,7 @@ export function ensurePinnedExtendTx(
         delete operationData.pinnedExtendTxs[operation.ref];
         if (operationData.agreedExtendResults)
             delete operationData.agreedExtendResults[operation.ref];
+        clearExtendSubmitVotesForOp(operationData, operation.ref);
         pin = undefined;
     }
     if (pin)
@@ -205,9 +206,21 @@ export function ensurePinnedExtendTx(
     return pin;
 }
 
+function clearExtendSubmitVotesForOp(operationData: OperationData, opRef: string): void {
+    if (!operationData.observationDedup)
+        return;
+    for (const [unl, dedup] of Object.entries(operationData.observationDedup)) {
+        if (dedup.extendSubmitVote?.opRef === opRef) {
+            const { extendSubmitVote, ...rest } = dedup;
+            operationData.observationDedup[unl] = rest;
+        }
+    }
+}
+
 export function clearPinnedExtendTx(operationData: OperationData, opRef: string): void {
     if (operationData.pinnedExtendTxs)
         delete operationData.pinnedExtendTxs[opRef];
+    clearExtendSubmitVotesForOp(operationData, opRef);
     if (operationData.agreedExtendResults)
         delete operationData.agreedExtendResults[opRef];
 }

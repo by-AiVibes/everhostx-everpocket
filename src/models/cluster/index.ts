@@ -101,7 +101,16 @@ export interface OperationData {
   agreedSignerListHash?: string;
   agreedExtendResults?: Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }>;
   nodeUserRegistrations?: Record<string, string>;
-  observationDedup?: Record<string, { nonce: number; observedLcl: number }>;
+  observationDedup?: Record<string, {
+    nonce: number;
+    observedLcl: number;
+    extendSubmitVote?: {
+      opRef: string;
+      hash: string;
+      lastLedgerSequence: number;
+      resultCode: string;
+    };
+  }>;
   /** Tenant sequences for which a quorum-confirmed extend already landed; never resubmit at these. */
   consumedTenantSequences?: number[];
   /** Agreed extend tx fields pinned on first attempt (hash stable across retries). */

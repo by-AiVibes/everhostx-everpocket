@@ -277,6 +277,29 @@ function mergeAgreedExtendResults(
     const out: Record<string, { hash: string; lastLedgerSequence: number; resultCode: string }> = {};
     const byRef = new Map<string, Map<string, { unls: Set<string>; sample: SubmittedTxObservation }>>();
 
+    if (operationData?.observationDedup) {
+        for (const [unlPubkey, dedup] of Object.entries(operationData.observationDedup)) {
+            const vote = dedup.extendSubmitVote;
+            if (!vote || vote.resultCode !== 'tesSUCCESS')
+                continue;
+            const unl = unlPubkey.toLowerCase();
+            const opRef = vote.opRef;
+            const sample: SubmittedTxObservation = {
+                ref: opRef,
+                hash: vote.hash,
+                lastLedgerSequence: vote.lastLedgerSequence,
+                resultCode: vote.resultCode,
+            };
+            if (!byRef.has(opRef))
+                byRef.set(opRef, new Map());
+            const refMap = byRef.get(opRef)!;
+            const key = `${vote.hash}|${vote.lastLedgerSequence}|${vote.resultCode}`;
+            if (!refMap.has(key))
+                refMap.set(key, { unls: new Set(), sample });
+            refMap.get(key)!.unls.add(unl);
+        }
+    }
+
     const nodesSeen = new Set<string>();
     for (const o of observations) {
         const unl = o.unlPubkey.toLowerCase();
@@ -386,6 +409,23 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
 
         if (!acceptObservationDedup(operationData, unlPubkey, msg.observedLcl, msg.nonce))
             continue;
+
+        const submittedTxForVote = Array.isArray(msg.submittedTx) ? msg.submittedTx : [];
+        for (const tx of submittedTxForVote) {
+            const opRef = resolveExtendOpRef(operationData, tx.ref);
+            if (!opRef || tx.resultCode !== 'tesSUCCESS')
+                continue;
+            const prev = operationData.observationDedup![unlPubkey];
+            operationData.observationDedup![unlPubkey] = {
+                ...prev,
+                extendSubmitVote: {
+                    opRef,
+                    hash: tx.hash,
+                    lastLedgerSequence: tx.lastLedgerSequence,
+                    resultCode: tx.resultCode,
+                },
+            };
+        }
 
         const points = normalizeObservationCheckpoints(msg);
         if (!points)
