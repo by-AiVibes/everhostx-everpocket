@@ -17,6 +17,11 @@ const SECP256K1_ORDER = Buffer.from('fffffffffffffffffffffffffffffffebaaedce6af4
 const RUNNER = path.join(__dirname, '../fixtures/acquire-cluster-run.js');
 const ec = new elliptic.ec('secp256k1');
 
+const KNOWN_VALIDATOR_SEED = Buffer.from('everpocket-acquire-known-validator-key');
+const KNOWN_VALIDATOR_PUB = '04ddb3722dd09effbc8226b565f3ef140614ad7c6d39cc3baa6d18be13dfc44e9ca79876daf1b16a43e5079239da6328be429e64a3ad3bfe910e604673e7d151df';
+const FIXED_KAT_IV = '95d6ad843e9b234edd35b59654774aed';
+const FIXED_KAT_PUB = '044d18f144078dbd9f2a0e8fe0a22d7ed0305d07318c416923f01cc1e5f2eb28deb3a6b07b7107dd0aaadc5f6063443cc4fe9ef892403f182f8298ffa210989640';
+
 const C0 = '11'.repeat(32);
 const C1 = '22'.repeat(32);
 const C2 = '33'.repeat(32);
@@ -172,6 +177,7 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
         const observed = `${report.stdio.out}\n${report.stdio.err}`;
         assert.match(observed, new RegExp(`acquire vote ignored from non-unl sender ${FOREIGN_UNL_KEY}`), 'a foreign ed-key sender must be recorded');
         assert.match(observed, /acquire vote ignored from non-unl sender unknown/, 'an undefined sender must be recorded');
+        assert.equal((report.uncaught || []).length, 0, 'an undefined sender must be ignored without crashing the runner');
     });
 
     test('a malformed contribution does not land', () => {
@@ -193,6 +199,7 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
         const report = runCluster({ nodeCount: 3, voteTimeout: 300 });
         assertLanded(report, 3);
         assert.equal(report.cipherWiped, true, 'acquire buffers passed to the cipher must be wiped after submit');
+        assert.equal(report.rounds[0].plain == null, false, 'the real cipher output must decrypt');
         assert.equal(report.scratchZero, true, 'acquire scratch buffers must be zero after submit');
         assert.equal(report.partsZero, true, 'sorted contribution parts must be zero after submit');
         for (const [contribution, count] of Object.entries(report.wipeCounts)) {
@@ -235,7 +242,7 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
         assertNoSecrets(memoSplit, 'memo mismatch');
 
         const unavailable = runCluster({ nodeCount: 3, unlFault: 'empty', voteTimeout: 300 });
-        assertAborted(unavailable, /acquire UNL unavailable/);
+        assertAborted(unavailable, /acquire consensus unavailable/);
         assertNoSecrets(unavailable, 'UNL unavailable');
 
         const shortIv = runCluster({ nodeCount: 1, cipherLengthFault: 'iv8', voteTimeout: 300 });
@@ -272,7 +279,7 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
 
     test('an empty UNL fails closed with 0 attempts', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'empty', voteTimeout: 300 });
-        assertAborted(report, /acquire UNL unavailable/);
+        assertAborted(report, /acquire consensus unavailable/);
         assertNoContributionVote(report);
     });
 
@@ -284,19 +291,19 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
 
     test('a UNL without this node fails closed', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'missing-self', voteTimeout: 300 });
-        assertAborted(report, /acquire UNL unavailable/);
+        assertAborted(report, /acquire consensus unavailable/);
         assertNoContributionVote(report);
     });
 
     test('a malformed UNL key fails closed', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'malformed', voteTimeout: 300 });
-        assertAborted(report, /acquire UNL unavailable/);
+        assertAborted(report, /acquire consensus unavailable/);
         assertNoContributionVote(report);
     });
 
     test('a duplicate UNL entry fails closed', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'duplicate', voteTimeout: 300 });
-        assertAborted(report, /acquire UNL unavailable/);
+        assertAborted(report, /acquire consensus unavailable/);
         assertNoContributionVote(report);
     });
 
@@ -383,6 +390,174 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
             assert.equal(round.memo.iv, expected.iv.toString('hex'), 'a replayed vote must not change the round IV');
         }
         assert.notEqual(report.rounds[0].memo.pub, report.rounds[1].memo.pub, 'round 2 must not reuse round 1 key');
+    });
+
+    test('an earlier non-UNL turn does not close the contribution election', () => {
+        const contributions = [C0, C1, C2];
+        const report = runCluster({
+            nodeCount: 3,
+            fixedContributions: contributions,
+            earlyNoise: 'contribution',
+            voteTimeout: 500
+        });
+        assertLanded(report, 3);
+        assert.equal((report.uncaught || []).length, 0);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
+        assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+    });
+
+    test('an earlier non-UNL turn does not close the memo election', () => {
+        const contributions = [C0, C1, C2];
+        const report = runCluster({
+            nodeCount: 3,
+            fixedContributions: contributions,
+            earlyNoise: 'memo',
+            voteTimeout: 500
+        });
+        assertLanded(report, 3);
+        assert.equal((report.uncaught || []).length, 0);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
+        assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+    });
+
+    test('identical memo bytes with different contributor sets do not land', () => {
+        const report = runCluster({
+            nodeCount: 3,
+            fixedContributions: [C0, C0, C0],
+            missContribution: [
+                { receiver: 0, sender: 1 },
+                { receiver: 1, sender: 0 },
+                { receiver: 2, sender: 2 }
+            ],
+            voteTimeout: 500
+        });
+        assertAborted(report, /acquire memo agreement below threshold/);
+    });
+
+    test('a second acquire on one node is rejected while the first is in flight', () => {
+        const contributions = [C0];
+        const report = runCluster({
+            nodeCount: 1,
+            concurrent: true,
+            fixedContributions: contributions,
+            voteTimeout: 400
+        });
+        assertLanded(report, 1);
+        assert.equal(report.attempts, 1, `one in-flight acquire must submit once, got ${report.attempts}`);
+        assert.equal(report.contributions.length, 1, 'the rejected call must not publish a contribution');
+        assert.equal(report.errors.length, 1);
+        assert.match(report.errors[0], /acquire already in progress/);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
+        assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+    });
+
+    test('three nodes each reject a second in-flight acquire and land one transaction', () => {
+        const contributions = [C0, C1, C2];
+        const report = runCluster({
+            nodeCount: 3,
+            concurrent: true,
+            fixedContributions: contributions,
+            voteTimeout: 500
+        });
+        assertLanded(report, 3);
+        assert.equal(report.attempts, 3, `one transaction must be submitted by each node, got ${report.attempts}`);
+        assert.equal(report.contributions.length, 3, 'each node publishes one contribution');
+        assert.equal(report.errors.length, 3);
+        for (const errorText of report.errors)
+            assert.match(errorText, /acquire already in progress/);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
+        assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+    });
+
+    test('the same UNL key in two cases fails closed', () => {
+        const report = runCluster({ nodeCount: 3, unlFault: 'case-duplicate', voteTimeout: 300 });
+        assertAborted(report, /acquire consensus unavailable/);
+        assertNoContributionVote(report);
+    });
+
+    test('an upper-case self key still belongs to this node', () => {
+        const contributions = [C0, C1, C2];
+        const report = runCluster({
+            nodeCount: 3,
+            unlFault: 'upper-self',
+            fixedContributions: contributions,
+            voteTimeout: 400
+        });
+        assertLanded(report, 3);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
+        assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+    });
+
+    test('upper-case sender keys still count toward the UNL', () => {
+        const contributions = [C0, C1, C2];
+        const report = runCluster({
+            nodeCount: 3,
+            upperCaseSenders: true,
+            fixedContributions: contributions,
+            voteTimeout: 400
+        });
+        assertLanded(report, 3);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
+        assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+    });
+
+    test('joined, seed, and iv hash are zero after a landed acquire', () => {
+        const report = runCluster({ nodeCount: 3, fixedContributions: [C0, C1, C2], voteTimeout: 300 });
+        assertLanded(report, 3);
+        assert.equal(report.joinedZero, true, 'joined must be the wiped scratch buffer');
+        assert.equal(report.seedZero, true, 'seed must be the wiped scratch buffer');
+        assert.equal(report.ivHashZero, true, 'ivHash must be the wiped scratch buffer');
+        assert.equal(report.rounds[0].plain == null, false, 'the real cipher output must decrypt');
+    });
+
+    test('joined, seed, and iv hash are zero when memo agreement aborts', () => {
+        const report = runCluster({ nodeCount: 3, tamperMemoSets: true, voteTimeout: 300 });
+        assertAborted(report, /acquire memo agreement below threshold/);
+        assert.equal(report.joinedZero, true, 'joined must be wiped when memo agreement aborts');
+        assert.equal(report.seedZero, true, 'seed must be wiped when memo agreement aborts');
+        assert.equal(report.ivHashZero, true, 'ivHash must be wiped when memo agreement aborts');
+    });
+
+    test('ripple-keypairs 1.1.4 derives the known validator public key', () => {
+        const key = derivePrivateKey(KNOWN_VALIDATOR_SEED, { validator: true }).toArrayLike(Buffer, 'be', 32);
+        assert.equal(uncompressedPublicKey(key).toString('hex'), KNOWN_VALIDATOR_PUB);
+    });
+
+    test('an unpatched acquire uses the known validator public key', () => {
+        const report = runCluster({
+            nodeCount: 3,
+            fixedContributions: [C0, C1, C2],
+            voteTimeout: 300
+        });
+        assertLanded(report, 3);
+        assert.equal((report.uncaught || []).length, 0);
+        assert.equal(report.rounds[0].memo.iv, FIXED_KAT_IV);
+        assert.equal(report.rounds[0].memo.pub, FIXED_KAT_PUB);
+        assert.equal(report.rounds[0].plain.messageKey, report.messageKey);
+    });
+
+    test('a pass-through crypto patch still returns the real validator public key', () => {
+        const contributions = [C0];
+        const report = runCluster({
+            nodeCount: 1,
+            fixedContributions: contributions,
+            observeCrypto: true,
+            voteTimeout: 300
+        });
+        assertLanded(report, 1);
+        assert.equal((report.uncaught || []).length, 0);
+        assert.ok(report.cryptoObservations.hashes.includes('sha256'), 'createHash must be called and return the real hash');
+        assert.ok(report.cryptoObservations.derives >= 1, 'derivePrivateKey must be called and return the real scalar');
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
+        assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+        assert.equal(report.rounds[0].plain.messageKey, report.messageKey);
     });
 });
 

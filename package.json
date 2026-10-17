@@ -20,7 +20,8 @@
         "@typescript-eslint/parser": "7.18.0",
         "bson": "4.7.2",
         "hotpocket-js-client": "0.5.7",
-        "ripple-keypairs": "1.1.4"
+        "ripple-keypairs": "1.1.4",
+        "tiny-secp256k1": "1.1.7"
     },
     "devDependencies": {
         "@types/node": "18.11.18",

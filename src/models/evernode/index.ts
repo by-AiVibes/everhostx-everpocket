@@ -1,9 +1,12 @@
+import { VoteElectorOptions } from "../vote";
+
 export interface AcquireOptions {
   host?: string;
   hostMessageKey?: string;
   instanceCfg?: InstanceConfig;
   preferredHosts?: string[];
   txOptions?: any;
+  voteElectorOptions?: VoteElectorOptions;
 }
 
 export interface InstanceConfig {

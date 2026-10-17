@@ -83,6 +83,25 @@ function createVoteBus(publicKeys, feeds, options = {}) {
     let prefillUsed = false;
     let nonUnlSent = false;
     const withhold = new Set(options.withhold || []);
+    const noiseDone = { contribution: false, memo: false };
+
+    function itemPhase(item) {
+        const vote = parseVote(item.message);
+        if (!vote || typeof vote.election !== 'string')
+            return '';
+        if (vote.election.startsWith('acquire_key_contribution'))
+            return 'contribution';
+        if (vote.election.startsWith('acquire_memo'))
+            return 'memo';
+        return '';
+    }
+
+    function missedContribution(receiverIndex, senderKey) {
+        if (!Array.isArray(options.missContribution))
+            return false;
+        const senderIndex = indexOf.has(senderKey) ? indexOf.get(senderKey) : -1;
+        return options.missContribution.some(rule => rule && rule.receiver === receiverIndex && rule.sender === senderIndex);
+    }
 
     function deliver(batch) {
         publicKeys.forEach((receiver, receiverIndex) => {
@@ -90,10 +109,33 @@ function createVoteBus(publicKeys, feeds, options = {}) {
             for (const item of ordered) {
                 if (!feeds[receiver])
                     continue;
-                const sender = item.undefinedSender ? undefined : { publicKey: item.publicKey, activeOn: 1 };
+                const phase = itemPhase(item);
+                if (phase === 'contribution' && missedContribution(receiverIndex, item.publicKey))
+                    continue;
+                const senderKey = options.upperCaseSenders && typeof item.publicKey === 'string'
+                    ? item.publicKey.toUpperCase()
+                    : item.publicKey;
+                const sender = item.undefinedSender ? undefined : { publicKey: senderKey, activeOn: 1 };
                 feeds[receiver](sender, Buffer.from(item.message));
             }
         });
+    }
+
+    function noiseVotes(election, count) {
+        const foreign = 'ed' + 'ab'.repeat(32);
+        const items = [];
+        for (let index = 0; index < count; index++) {
+            items.push({
+                publicKey: foreign,
+                message: encodeVote({ _evpType: 'unlVote', election, data: 'ab'.repeat(32) })
+            });
+            items.push({
+                publicKey: foreign,
+                message: encodeVote({ _evpType: 'unlVote', election, data: 'cd'.repeat(32) }),
+                undefinedSender: true
+            });
+        }
+        return items;
     }
 
     function flush() {
@@ -102,9 +144,19 @@ function createVoteBus(publicKeys, feeds, options = {}) {
         if (!prefillUsed && Array.isArray(options.prefill) && options.prefill.length) {
             prefillUsed = true;
             deliver(options.prefill.concat(batch));
-        } else {
-            deliver(batch);
+            return;
         }
+        const phase = batch.length ? itemPhase(batch[0]) : '';
+        const election = phase ? (parseVote(batch[0].message) || {}).election : '';
+        if (phase && options.earlyNoise === phase && !noiseDone[phase]) {
+            noiseDone[phase] = true;
+            // Noise is its own turn. The honest batch is a later timer, after the
+            // elector has already considered the non-UNL messages.
+            deliver(noiseVotes(election, publicKeys.length));
+            setTimeout(() => deliver(batch), 0);
+            return;
+        }
+        deliver(batch);
     }
 
     return {
@@ -435,6 +487,12 @@ function partsAreWiped(ctx) {
     return scratch.parts.every(part => Buffer.isBuffer(part) && isZero(part));
 }
 
+function namedBufferWiped(ctx, field) {
+    const scratch = ctx.acquireKeyScratch;
+    const value = scratch && scratch[field];
+    return Buffer.isBuffer(value) && value.length > 0 && isZero(value);
+}
+
 function ivAliasesKey(iv, key) {
     if (!key || key.length < iv.length)
         return false;
@@ -514,6 +572,14 @@ function shapeUnl(publicKeys, selfKey, config) {
         return [{ publicKey: 'not-an-ed-key', activeOn: 1 }].concat(nodes.slice(1));
     if (config.unlFault === 'duplicate')
         return nodes.concat([{ publicKey: nodes[0].publicKey, activeOn: 2 }]);
+    if (config.unlFault === 'case-duplicate')
+        return nodes.concat([{ publicKey: nodes[0].publicKey.toUpperCase(), activeOn: 2 }]);
+    if (config.unlFault === 'upper-self') {
+        return nodes.map(node => ({
+            publicKey: node.publicKey === selfKey ? node.publicKey.toUpperCase() : node.publicKey,
+            activeOn: node.activeOn
+        }));
+    }
     return nodes;
 }
 
@@ -556,6 +622,44 @@ function installCipherLengthFault(config) {
     };
 }
 
+function installEphemeralKeyFault(config) {
+    if (config.ephemeralKeyFault !== 'zero' && config.ephemeralKeyFault !== 'order')
+        return () => { };
+    const secp = require('ripple-keypairs/dist/secp256k1');
+    const originalDerive = secp.derivePrivateKey;
+    const forced = config.ephemeralKeyFault === 'order' ? SECP256K1_ORDER : Buffer.alloc(32, 0);
+    secp.derivePrivateKey = function () {
+        const scalar = originalDerive.apply(secp, arguments);
+        scalar.toArrayLike = function () {
+            return Buffer.from(forced);
+        };
+        return scalar;
+    };
+    return () => {
+        secp.derivePrivateKey = originalDerive;
+    };
+}
+
+function installPassThroughObserver(config, record) {
+    if (!config.observeCrypto)
+        return () => { };
+    const secp = require('ripple-keypairs/dist/secp256k1');
+    const originalCreateHash = crypto.createHash;
+    const originalDerive = secp.derivePrivateKey;
+    crypto.createHash = function (algorithm) {
+        record.hashes.push(algorithm);
+        return originalCreateHash.apply(crypto, arguments);
+    };
+    secp.derivePrivateKey = function () {
+        record.derives += 1;
+        return originalDerive.apply(secp, arguments);
+    };
+    return () => {
+        crypto.createHash = originalCreateHash;
+        secp.derivePrivateKey = originalDerive;
+    };
+}
+
 async function buildCluster(config, ledger, definitions) {
     const nodeCount = config.nodeCount;
     const publicKeys = [];
@@ -590,7 +694,10 @@ async function buildCluster(config, ledger, definitions) {
         equivocate: config.equivocate,
         duplicateAll: config.duplicateAll,
         lateReplay: config.lateReplay,
-        prefill
+        prefill,
+        earlyNoise: config.earlyNoise,
+        missContribution: config.missContribution,
+        upperCaseSenders: config.upperCaseSenders
     });
     const helper = createXrplHelper(definitions);
     const signerList = [];
@@ -674,6 +781,7 @@ async function run(config) {
     installNetworkStubs(hostAccount);
     const cipherBuffers = [];
     const originalPrepare = evernode.TenantClient.prototype.prepareAcquireLeaseTransaction;
+    // Pass-through: record the exact buffers the cipher receives, then return its real result.
     evernode.TenantClient.prototype.prepareAcquireLeaseTransaction = async function (hostAddress, requirement, options = {}) {
         if (options && options.iv)
             cipherBuffers.push(options.iv);
@@ -681,6 +789,16 @@ async function run(config) {
             cipherBuffers.push(options.ephemPrivateKey);
         return originalPrepare.call(this, hostAddress, requirement, options);
     };
+    const uncaught = [];
+    const noteUncaught = (kind, error) => {
+        uncaught.push({ kind, message: error && (error.message || String(error)) });
+    };
+    const onException = (error) => noteUncaught('uncaughtException', error);
+    const onRejection = (reason) => noteUncaught('unhandledRejection', reason);
+    if (config.recordUncaught !== false) {
+        process.on('uncaughtException', onException);
+        process.on('unhandledRejection', onRejection);
+    }
 
     const stdio = captureStdio();
     const fills = captureFill();
@@ -695,28 +813,57 @@ async function run(config) {
         contexts = cluster.nodes.map(node => node.evernode);
         const offline = new Set(config.offline || []);
         const roundCount = config.rounds || 1;
+        const cryptoObservations = { hashes: [], derives: 0 };
         const restoreCipherFault = installCipherLengthFault(config);
+        const restoreKeyFault = installEphemeralKeyFault(config);
+        const restoreObserver = installPassThroughObserver(config, cryptoObservations);
         for (let round = 0; round < roundCount; round++) {
             if (round > 0 && config.lateReplay)
                 cluster.bus.replayStale();
             const beforeLanded = ledger.landed.length;
             const beforeWire = cluster.bus.wire.length;
             const beforeSubmitted = ledger.submissions.length;
-            const outcomes = await Promise.all(cluster.nodes.map(async (node, index) => {
+            const oneAcquire = async (node, index) => {
                 if (offline.has(index))
                     return { hash: null, error: null, result: null, skipped: true };
                 const instanceCfg = { ...(config.instanceCfg || DEFAULT_INSTANCE) };
                 if (config.swapNode === index)
                     instanceCfg.ownerPubkey = `ed${'ab'.repeat(32)}`;
                 try {
-                    const result = await node.evernode.acquireSubmit(HOST_ADDRESS, leaseOffer(), messageKey, {
+                    const acquireDeadline = config.acquireDeadline || Math.max(8000, (config.voteTimeout || 800) * 6);
+                    const pending = node.evernode.acquireSubmit(HOST_ADDRESS, leaseOffer(), messageKey, {
                         instanceCfg,
                         voteElectorOptions: { timeout: config.voteTimeout || 800 }
                     });
-                    return { hash: result && result.hash, error: null, result };
+                    let timer;
+                    const deadline = new Promise(resolve => {
+                        timer = setTimeout(() => resolve({ deadline: true }), acquireDeadline);
+                    });
+                    const raced = await Promise.race([
+                        pending.then(value => ({ value }), error => ({ error })),
+                        deadline
+                    ]);
+                    clearTimeout(timer);
+                    if (raced.deadline)
+                        return { hash: null, error: 'acquire did not finish', result: null };
+                    if (raced.error)
+                        return { hash: null, error: raced.error && (raced.error.stack || raced.error.message || String(raced.error)), result: null };
+                    return { hash: raced.value && raced.value.hash, error: null, result: raced.value };
                 } catch (error) {
                     return { hash: null, error: error && (error.stack || error.message || String(error)), result: null };
                 }
+            };
+            const outcomes = await Promise.all(cluster.nodes.map(async (node, index) => {
+                if (!config.concurrent)
+                    return oneAcquire(node, index);
+                const [first, second] = await Promise.all([oneAcquire(node, index), oneAcquire(node, index)]);
+                return {
+                    hash: first.hash || second.hash,
+                    error: null,
+                    errors: [first.error, second.error].filter(Boolean),
+                    result: first.result || second.result,
+                    skipped: first.skipped && second.skipped
+                };
             }));
             const landedNow = ledger.landed.slice(beforeLanded);
             const submittedNow = ledger.submissions.slice(beforeSubmitted);
@@ -745,8 +892,12 @@ async function run(config) {
             for (const outcome of outcomes) {
                 if (outcome.skipped)
                     continue;
-                if (outcome.error)
+                if (Array.isArray(outcome.errors)) {
+                    for (const errorText of outcome.errors)
+                        errors.push(errorText);
+                } else if (outcome.error) {
                     errors.push(outcome.error);
+                }
                 returns.push(outcome.result == null ? null : JSON.stringify(outcome.result));
             }
             rounds.push({
@@ -758,6 +909,8 @@ async function run(config) {
             });
         }
         restoreCipherFault();
+        restoreKeyFault();
+        restoreObserver();
 
         const contributions = readContributions(cluster.bus.wire);
         const persisted = persistedState(contexts);
@@ -818,6 +971,11 @@ async function run(config) {
             contributions,
             scratchZero: contexts.every(scratchIsWiped),
             partsZero: contexts.every(partsAreWiped),
+            joinedZero: contexts.length > 0 && contexts.every(ctx => namedBufferWiped(ctx, 'joined')),
+            seedZero: contexts.length > 0 && contexts.every(ctx => namedBufferWiped(ctx, 'seed')),
+            ivHashZero: contexts.length > 0 && contexts.every(ctx => namedBufferWiped(ctx, 'ivHash')),
+            uncaught,
+            cryptoObservations,
             keyFound,
             ivIsSliceOfEphemeralKey,
             pubDerivedFromIv,
@@ -835,21 +993,35 @@ async function run(config) {
         };
     } finally {
         evernode.TenantClient.prototype.prepareAcquireLeaseTransaction = originalPrepare;
+        if (config.recordUncaught !== false) {
+            process.off('uncaughtException', onException);
+            process.off('unhandledRejection', onRejection);
+        }
         fills.restore();
         stdio.restore();
     }
 }
 
-const config = JSON.parse(process.argv[2]);
-run(config).then((report) => {
-    fs.writeFileSync(config.resultPath, JSON.stringify(report));
-}).catch((error) => {
-    const fatal = error && (error.stack || String(error));
-    try {
-        fs.writeFileSync(config.resultPath, JSON.stringify({ fatal, landed: 0, attempts: 0, errors: [fatal], rounds: [] }));
-    } catch (writeError) {
-        process.stderr.write(String(writeError));
-    }
-    process.stderr.write(fatal);
-    process.exit(1);
-});
+const { isMainThread, workerData } = require('worker_threads');
+
+function publish(config) {
+    run(config).then((report) => {
+        fs.writeFileSync(config.resultPath, JSON.stringify(report));
+    }).catch((error) => {
+        const fatal = error && (error.stack || String(error));
+        try {
+            fs.writeFileSync(config.resultPath, JSON.stringify({ fatal, landed: 0, attempts: 0, errors: [fatal], rounds: [] }));
+        } catch (writeError) {
+            process.stderr.write(String(writeError));
+        }
+        process.stderr.write(fatal);
+        process.exit(1);
+    });
+}
+
+// A worker cannot chdir, so the out-of-range test passes workerData and holds
+// the parent cwd. Child processes still pass the config on argv.
+if (!isMainThread && workerData)
+    publish(workerData);
+else if (isMainThread && process.argv[2])
+    publish(JSON.parse(process.argv[2]));

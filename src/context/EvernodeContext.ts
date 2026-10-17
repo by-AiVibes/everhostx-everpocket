@@ -25,22 +25,14 @@ const ACQUIRE_IV_DOMAIN = Buffer.from('everpocket-acquire-iv-v1');
 const ACQUIRE_KEY_DOMAIN = Buffer.from('everpocket-acquire-ephemeral-v2');
 const ACQUIRE_UNL_KEY = /^ed[0-9a-f]{64}$/i;
 
-// EncryptionHelper.encrypt is the public ECIES entry. A caller-supplied key that
-// fails the curve library's check used to stick eccrypto's retry loop, so reject
-// it here before that loop can see the buffer.
-const originalEncryptionHelperEncrypt = evernode.EncryptionHelper.encrypt.bind(evernode.EncryptionHelper);
-evernode.EncryptionHelper.encrypt = async function (publicKey: string, message: any, options: { iv?: Buffer; ephemPrivateKey?: Buffer } = {}) {
-    const suppliedKey = options && options.ephemPrivateKey;
-    if (suppliedKey != null && !tinySecp256k1.isPrivate(suppliedKey))
-        throw new Error('acquire ephemeral key is not a valid secp256k1 private key');
-    return originalEncryptionHelperEncrypt(publicKey, message, options);
-};
-
 interface AcquireKeyScratch {
     iv: Buffer;
     ephemPrivateKey: Buffer;
     contribution: Buffer;
     parts: Buffer[];
+    joined: Buffer | null;
+    seed: Buffer | null;
+    ivHash: Buffer | null;
 }
 
 /**
@@ -52,7 +44,7 @@ class AcquireUnlVoteElector extends AllVoteElector {
 
     public constructor(publicKeys: string[], timeout: number) {
         super(publicKeys.length, timeout);
-        this.unlKeys = new Set(publicKeys);
+        this.unlKeys = new Set(publicKeys.map((publicKey: string) => publicKey.toLowerCase()));
     }
 
     public election(electionName: string, voteEmitter: any, context: VoteContext): Promise<any[]> {
@@ -71,7 +63,8 @@ class AcquireUnlVoteElector extends AllVoteElector {
             const consider = () => {
                 const seen = new Map<string, number>();
                 for (const vote of latest) {
-                    const publicKey = vote && vote.sender && vote.sender.publicKey;
+                    const raw = vote && vote.sender && vote.sender.publicKey;
+                    const publicKey = raw ? String(raw).toLowerCase() : '';
                     if (!publicKey || !this.unlKeys.has(publicKey))
                         continue;
                     seen.set(publicKey, (seen.get(publicKey) || 0) + 1);
@@ -105,6 +98,8 @@ class EvernodeContext {
     private initialized: boolean = false;
     // Exact buffers the cipher used. finally zeroes them; there is no getter.
     private acquireKeyScratch: AcquireKeyScratch | null = null;
+    // One acquireSubmit at a time on this instance. A second call rejects immediately.
+    private acquireInFlight: boolean = false;
     public hpContext: HotPocketContext;
     public xrplContext: XrplContext;
     public voteContext: VoteContext;
@@ -436,8 +431,12 @@ class EvernodeContext {
      * @returns Result of the submitted transaction.
      */
     public async acquireSubmit(hostAddress: string, leaseOffer: URIToken, messageKey: string, options: AcquireOptions = {}): Promise<any> {
+        if (this.acquireInFlight)
+            throw new Error('acquire already in progress');
+        this.acquireInFlight = true;
         // Get transaction details to use for xrpl tx submission.
         const tenantClient = new evernode.TenantClient(this.xrplContext.xrplAcc.address);
+        try {
         await tenantClient.connect();
 
         // lclHash is public consensus data, so it cannot seed the cipher.
@@ -461,6 +460,9 @@ class EvernodeContext {
         await tenantClient.disconnect();
 
         return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
+        } finally {
+            this.acquireInFlight = false;
+        }
     }
 
     /**
@@ -473,12 +475,15 @@ class EvernodeContext {
             const timeout = this.#acquireVoteTimeout(options);
             const contributors = await this.#agreeAcquireContributions(unl, timeout);
             const scratch = this.acquireKeyScratch;
+            if (!scratch)
+                throw new Error('acquire key scratch is missing');
             const cipherOptions = {
                 leaseOfferIndex: leaseOffer.index,
-                iv: scratch ? scratch.iv : undefined,
-                ephemPrivateKey: scratch ? scratch.ephemPrivateKey : undefined
+                iv: scratch.iv,
+                ephemPrivateKey: scratch.ephemPrivateKey
             };
             this.#assertAcquireCipherMaterial(cipherOptions.iv, cipherOptions.ephemPrivateKey);
+            this.#assertAcquireEphemeralKey(cipherOptions.ephemPrivateKey);
             const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(hostAddress, { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messageKey }, cipherOptions);
             await this.#agreeAcquireMemo(preparedAcquireTxn, contributors, unl, timeout);
             return preparedAcquireTxn;
@@ -488,7 +493,7 @@ class EvernodeContext {
     }
 
     #acquireVoteTimeout(options: AcquireOptions): number {
-        const requested = (options as AcquireOptions & { voteElectorOptions?: VoteElectorOptions }).voteElectorOptions?.timeout;
+        const requested = options.voteElectorOptions?.timeout;
         return requested || TIMEOUT;
     }
 
@@ -498,16 +503,27 @@ class EvernodeContext {
     #requireAcquireUnl(): { publicKey: string }[] {
         const listed = this.hpContext.getContractUnl();
         if (!Array.isArray(listed) || listed.length < 1)
-            throw new Error('acquire UNL unavailable');
+            throw new Error('acquire consensus unavailable');
         const seen = new Set<string>();
         for (const node of listed) {
             const publicKey = node && node.publicKey;
-            if (typeof publicKey !== 'string' || !ACQUIRE_UNL_KEY.test(publicKey) || seen.has(publicKey))
-                throw new Error('acquire UNL unavailable');
+            if (typeof publicKey !== 'string' || !ACQUIRE_UNL_KEY.test(publicKey))
+                throw new Error('acquire consensus unavailable');
+            const identity = publicKey.toLowerCase();
+            for (const existing of seen) {
+                if (existing.toLowerCase() === identity)
+                    throw new Error('acquire consensus unavailable');
+            }
             seen.add(publicKey);
         }
-        if (!seen.has(this.hpContext.publicKey))
-            throw new Error('acquire UNL unavailable');
+        const selfKey = this.hpContext.publicKey.toLowerCase();
+        let selfFound = false;
+        for (const existing of seen) {
+            if (existing.toLowerCase() === selfKey)
+                selfFound = true;
+        }
+        if (!selfFound)
+            throw new Error('acquire consensus unavailable');
         return listed;
     }
 
@@ -521,7 +537,10 @@ class EvernodeContext {
             iv: Buffer.alloc(ACQUIRE_IV_LENGTH),
             ephemPrivateKey: Buffer.alloc(ACQUIRE_KEY_LENGTH),
             contribution,
-            parts: []
+            parts: [],
+            joined: null,
+            seed: null,
+            ivHash: null
         };
         const electionName = `acquire_key_contribution${this.voteContext.getUniqueNumber()}`;
         const votes = await this.voteContext.vote(electionName, [contribution.toString('hex')], new AcquireUnlVoteElector(unl.map(node => node.publicKey), timeout));
@@ -542,6 +561,9 @@ class EvernodeContext {
         const derived = this.#deriveAcquireMaterial(parts);
         this.acquireKeyScratch.iv = derived.iv;
         this.acquireKeyScratch.ephemPrivateKey = derived.ephemPrivateKey;
+        this.acquireKeyScratch.joined = derived.joined;
+        this.acquireKeyScratch.seed = derived.seed;
+        this.acquireKeyScratch.ivHash = derived.ivHash;
         return contributors;
     }
 
@@ -550,13 +572,13 @@ class EvernodeContext {
      * Senders outside the UNL, including a missing sender, are ignored and logged.
      */
     #takeAcquireVotes(votes: any[], unl: { publicKey: string }[]): { publicKey: string; data: any }[] {
-        const allowed = new Set(unl.map(node => node.publicKey));
+        const allowed = new Set(unl.map(node => node.publicKey.toLowerCase()));
         const bySender = new Map<string, any>();
         for (const vote of (Array.isArray(votes) ? votes : [])) {
-            const sender = vote && vote.sender;
-            const publicKey = sender && sender.publicKey;
+            const raw = vote && vote.sender && vote.sender.publicKey;
+            const publicKey = raw ? String(raw).toLowerCase() : '';
             if (!publicKey || !allowed.has(publicKey)) {
-                log(`acquire vote ignored from non-unl sender ${publicKey || 'unknown'}`);
+                log(`acquire vote ignored from non-unl sender ${raw || 'unknown'}`);
                 continue;
             }
             if (bySender.has(publicKey))
@@ -569,13 +591,22 @@ class EvernodeContext {
     /**
      * IV and key are domain-separated. The scalar step belongs to ripple-keypairs.
      */
-    #deriveAcquireMaterial(parts: Buffer[]): { iv: Buffer; ephemPrivateKey: Buffer } {
+    #deriveAcquireMaterial(parts: Buffer[]): { iv: Buffer; ephemPrivateKey: Buffer; joined: Buffer; seed: Buffer; ivHash: Buffer } {
         const joined = Buffer.concat(parts);
         const ivHash = nodeCrypto.createHash('sha256').update(ACQUIRE_IV_DOMAIN).update(joined).digest();
         const iv = Buffer.from(ivHash.subarray(0, ACQUIRE_IV_LENGTH));
         const seed = Buffer.concat([ACQUIRE_KEY_DOMAIN, joined]);
         const ephemPrivateKey = derivePrivateKey(seed, { validator: true }).toArrayLike(Buffer, 'be', ACQUIRE_KEY_LENGTH);
-        return { iv, ephemPrivateKey };
+        return { iv, ephemPrivateKey, joined, seed, ivHash };
+    }
+
+    /**
+     * Reject a scalar the curve library would refuse. eccrypto retries a supplied
+     * key forever, so this runs on the exact buffer about to be encrypted.
+     */
+    #assertAcquireEphemeralKey(ephemPrivateKey: Buffer): void {
+        if (!tinySecp256k1.isPrivate(ephemPrivateKey))
+            throw new Error('acquire ephemeral key is not a valid secp256k1 private key');
     }
 
     #assertAcquireCipherMaterial(iv: Buffer | undefined, ephemPrivateKey: Buffer | undefined): void {
@@ -616,6 +647,12 @@ class EvernodeContext {
         scratch.contribution.fill(0);
         for (const part of scratch.parts)
             part.fill(0);
+        if (scratch.joined)
+            scratch.joined.fill(0);
+        if (scratch.seed)
+            scratch.seed.fill(0);
+        if (scratch.ivHash)
+            scratch.ivHash.fill(0);
     }
 
     /**

@@ -2,25 +2,27 @@
 
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
-const { spawnSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { Worker } = require('node:worker_threads');
+const { spawnSync } = require('child_process');
+const { Worker } = require('worker_threads');
 const { describe, test } = require('node:test');
 const evernode = require('evernode-js-client');
 const kp = require('ripple-keypairs');
 
-require('../../dist/context/EvernodeContext');
-
-const SECP256K1_ORDER = Buffer.from('fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141', 'hex');
 const FAST_LIMIT_MS = 2000;
+const FIXED_LCL_HASH = '1a20bec21ef8038f32eaed2f4d1907b9f0bdcc02e05d1ee09b199ac13db6518a';
+const RUNNER = path.join(__dirname, '../fixtures/acquire-cluster-run.js');
+const CONTEXT_ENTRY = path.join(__dirname, '../../dist/context/EvernodeContext.js');
 
 describe('acquire encrypt entry rejects an invalid ephemeral key', { concurrency: 1 }, () => {
     test('a zero ephemeral key throws a normal error in under 2 seconds', async () => {
-        await assertFastInvalidKey(Buffer.alloc(32, 0));
+        await assertAcquireRejects('zero');
     });
 
     test('a curve-order ephemeral key throws a normal error in under 2 seconds', async () => {
-        await assertFastInvalidKey(Buffer.from(SECP256K1_ORDER));
+        await assertAcquireRejects('order');
     });
 
     test('a library-derived ephemeral key still encrypts', async () => {
@@ -35,6 +37,19 @@ describe('acquire encrypt entry rejects an invalid ephemeral key', { concurrency
         assert.equal(typeof encrypted, 'string', 'a valid ephemeral key must encrypt');
         assert.ok(Date.now() - started < FAST_LIMIT_MS, 'a valid ephemeral key must encrypt quickly');
     });
+
+    test('loading EvernodeContext does not replace EncryptionHelper.encrypt', () => {
+        const child = spawnSync(process.execPath, ['-e', `
+            const evernode = require('evernode-js-client');
+            const before = evernode.EncryptionHelper.encrypt;
+            require(${JSON.stringify(CONTEXT_ENTRY)});
+            if (evernode.EncryptionHelper.encrypt !== before) {
+                console.error('EncryptionHelper.encrypt was replaced');
+                process.exit(1);
+            }
+        `], { cwd: path.join(__dirname, '../..'), encoding: 'utf8' });
+        assert.equal(child.status, 0, `requiring EvernodeContext must leave EncryptionHelper.encrypt untouched\n${child.stdout}\n${child.stderr}`);
+    });
 });
 
 describe('Math.random stays banned with inline config disabled', { concurrency: 1 }, () => {
@@ -42,66 +57,102 @@ describe('Math.random stays banned with inline config disabled', { concurrency: 
         const eslint = path.join(__dirname, '../../node_modules/.bin/eslint');
         const config = path.join(__dirname, '../../.eslintrc.json');
         const source = spawnSync(eslint, ['-c', config, '--no-inline-config', '--ext', '.ts', path.join(__dirname, '../../src')], {
+            cwd: path.join(__dirname, '../..'),
             encoding: 'utf8'
         });
         assert.equal(source.status, 0, `Math.random must not be used in src, including behind an inline disable\n${source.stdout}\n${source.stderr}`);
     });
 });
 
-async function assertFastInvalidKey(key) {
-    const { publicKey } = hostKey();
+async function assertAcquireRejects(fault) {
     const started = Date.now();
-    await assert.rejects(
-        () => encryptOnWorker(publicKey, key),
-        (error) => {
-            assert.equal(error instanceof Error, true, 'invalid ephemeral key must throw an Error');
-            assert.match(error.message, /acquire ephemeral key is not a valid secp256k1 private key/);
-            return true;
-        }
-    );
+    let report;
+    try {
+        report = await acquireInWorker(fault);
+    } catch (error) {
+        if (error && error.timedOut)
+            assert.fail('encrypt did not reject out-of-range key within 2s');
+        throw error;
+    }
     const elapsed = Date.now() - started;
     assert.ok(elapsed < FAST_LIMIT_MS, `invalid ephemeral key must fail in under ${FAST_LIMIT_MS}ms, took ${elapsed}ms`);
+    assert.match((report.errors || []).join('\n'), /acquire ephemeral key is not a valid secp256k1 private key/);
+    assert.equal(report.attempts, 0, 'an invalid ephemeral key must not reach the ledger');
+    assert.equal(report.landed, 0);
 }
 
-function encryptOnWorker(publicKey, key) {
+function acquireInWorker(fault) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acquire-oor-'));
+    const resultPath = path.join(root, 'cluster-result.json');
+    const config = {
+        nodeCount: 1,
+        lclHash: FIXED_LCL_HASH,
+        rounds: 1,
+        voteTimeout: 400,
+        ephemeralKeyFault: fault,
+        resultPath
+    };
+    const previousCwd = process.cwd();
+    // acquireSubmit writes acquires.json relative to cwd. A worker cannot
+    // chdir, and cwd is process-global, so this test holds the temp directory
+    // until that worker exits. The worker itself calls acquireSubmit.
+    process.chdir(root);
     return new Promise((resolve, reject) => {
-        const worker = new Worker(`
-            const { parentPort, workerData } = require('node:worker_threads');
-            const crypto = require('crypto');
-            const evernode = require('evernode-js-client');
-            require(workerData.entry);
-            evernode.EncryptionHelper.encrypt(workerData.publicKey, { ping: 1 }, {
-                iv: crypto.randomBytes(16),
-                ephemPrivateKey: Buffer.from(workerData.key)
-            }).then((value) => {
-                parentPort.postMessage({ ok: true, type: typeof value });
-            }, (error) => {
-                parentPort.postMessage({ ok: false, message: error && error.message ? error.message : String(error) });
-            });
-        `, {
-            eval: true,
-            workerData: {
-                entry: path.join(__dirname, '../../dist/context/EvernodeContext.js'),
-                publicKey,
-                key: Buffer.from(key)
+        let settled = false;
+        let timedOut = false;
+        let worker;
+        const restoreCwd = () => {
+            try {
+                process.chdir(previousCwd);
+            } catch (error) {
+                void error;
             }
-        });
-        const timer = setTimeout(() => {
-            worker.terminate();
-            reject(new Error('encrypt entry timed out'));
-        }, FAST_LIMIT_MS);
-        worker.once('message', (message) => {
+        };
+        const finish = (fn) => {
+            if (settled)
+                return;
+            settled = true;
             clearTimeout(timer);
+            restoreCwd();
+            fn();
+        };
+        const timer = setTimeout(() => {
+            timedOut = true;
             worker.terminate();
-            if (message.ok)
-                resolve(message.type);
-            else
-                reject(new Error(message.message));
+        }, FAST_LIMIT_MS);
+        try {
+            worker = new Worker(RUNNER, { workerData: config });
+        } catch (error) {
+            finish(() => {
+                fs.rmSync(root, { recursive: true, force: true });
+                reject(error);
+            });
+            return;
+        }
+        worker.once('exit', () => {
+            finish(() => {
+                if (timedOut) {
+                    fs.rmSync(root, { recursive: true, force: true });
+                    const error = new Error('encrypt did not reject out-of-range key within 2s');
+                    error.timedOut = true;
+                    reject(error);
+                    return;
+                }
+                try {
+                    resolve(JSON.parse(fs.readFileSync(resultPath, 'utf8')));
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    fs.rmSync(root, { recursive: true, force: true });
+                }
+            });
         });
         worker.once('error', (error) => {
-            clearTimeout(timer);
             worker.terminate();
-            reject(error);
+            finish(() => {
+                fs.rmSync(root, { recursive: true, force: true });
+                reject(error);
+            });
         });
     });
 }
