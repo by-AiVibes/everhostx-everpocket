@@ -1,0 +1,70 @@
+aborts-companion.test.js | seed 0 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 1 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 2 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 3 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 4 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 5 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 6 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 7 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 8 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed 9 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | seed-3 double-pay aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | OVERLAP aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | LAG aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | NOLAG aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | LIAR liehash aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | LIAR lieidx aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | TXNULL aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | SEQFAIL aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | REALHASH aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | RESTART aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | COLLUDE2 aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+aborts-companion.test.js | aborts companions | (d)+(e) | 21 subtests failed
+acquire-csprng.test.js | acquire IV and ephemeral key come from a CSPRNG | #4 | context/EvernodeContext.ts:359: acquire IVs must differ for the same lclHash: 1a20bec21ef8038f32eaed2f4d1907b9 vs 1a20bec21ef8038f32eaed2f4d1907b9
+born-expired.test.js | pin stuck behind its LastLedgerSequence still lands once within 100 rounds | (e) | cluster/ExtendPinning.ts:1: anchor 10000 is ahead of pinned LLS 9000; re-pin required; landed[C] == 1, got 0
+born-expired.test.js | pin stuck behind its LastLedgerSequence is dequeued within 100 rounds | (e) | cluster/ExtendPinning.ts:1: born-expired op never completed: ["extend_node:C#0"]
+born-expired.test.js | pin stuck behind its LastLedgerSequence: aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+collusion-strict.test.js | quorumExtendCompletesOp refuses a 2-node COLLUDETX | (d) | context/ClusterContext.ts:144: quorumExtendCompletesOp missing (MODULE_NOT_FOUND)
+collusion-strict.test.js | 2/5 collude: aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+double-pay.test.js | seed-3 double-pay: landed per op == 1, all complete | (e) | seed3: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+double-pay.test.js | throwafter on the submitter while another op is queued | (e) | OVERLAP: ops never completed: extend_node:C#0,extend_node:D#0
+lag.test.js | one node 40 ledgers behind: no aborts, no divergence, op completes | (d)+(e) | processConsensusUserInputs is not a function
+lag.test.js | all nodes healthy: no aborts at all | (d)+(e) | processConsensusUserInputs is not a function
+liars-quorum.test.js | liar duplicate checkpoints lose to 4 honest observers | (d) | cluster/AnchorObservation.ts:1: applyObservationInputs missing (MODULE_NOT_FOUND)
+liars-quorum.test.js | liar distinct fake indexes lose to 4 honest observers | (d) | cluster/AnchorObservation.ts:1: applyObservationInputs missing (MODULE_NOT_FOUND)
+liars-quorum.test.js | liar double observation loses to 4 honest observers | (d) | cluster/AnchorObservation.ts:1: applyObservationInputs missing (MODULE_NOT_FOUND)
+liars-quorum.test.js | liar with multiple registered user keys loses to 4 honest observers | (d) | cluster/AnchorObservation.ts:1: applyObservationInputs missing (MODULE_NOT_FOUND)
+liars-quorum.test.js | 3 honest plus one duplicated honest node is a no-op | (d) | cluster/AnchorObservation.ts:1: applyObservationInputs missing (MODULE_NOT_FOUND)
+liars.test.js | liar with 4 duplicate checkpoints | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+liars.test.js | liar with distinct fake indexes | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+liars.test.js | liar double observation in one round | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+liars.test.js | liar with multiple registered user keys | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+liars.test.js | liar fake extend result loses to 4 honest | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+liars.test.js | sim: 1/5 fake hash and 1/5 fake index keep liveness and agreement | (e) | LIAR-liehash: ops never completed: extend_node:C#0
+production-backend.test.js | public init reaches a loopback rippled for a pinned ledger read | (c) | production getLedgerHashAt is missing from XrplContext
+quorum-noop.test.js | quorumThreshold is ceil(2n/3) | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+quorum-noop.test.js | empty input set is a no-op | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+quorum-noop.test.js | 3 of 5 honest (below quorum 4) is a no-op | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+quorum-noop.test.js | stale observations (beyond max_input_ledger_offset) are a no-op | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+quorum-noop.test.js | non-UNL submitters are a no-op | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+quorum-noop.test.js | quorum (4 of 5) does move state | (d) | Cannot find module '/workspace/dist/cluster/AnchorObservation'
+reader-split.test.js | getTxAt returns null on one node: no divergence, op completes once | (e) | TXNULL: ops never completed: extend_node:C#0
+reader-split.test.js | sequence reader fails on one node: no divergence, ops complete once | (e) | SEQFAIL: ops never completed: extend_node:C#0,extend_node:D#0
+real-hash.test.js | real-format signed hashes: every op completes, landed == 1 | (e) | REALHASH: ops never completed: extend_node:C#0,extend_node:D#0
+restart.test.js | restart after submit (throwafter + crash, no observation): landed == 1 | (e) | RESTART: ops never completed: extend_node:C#0
+round-aborts.test.js | healthy round start: aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
+sim-seeds.test.js | seed 0 x 100 rounds | (e) | seed0: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 1 x 100 rounds | (e) | seed1: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 2 x 100 rounds | (e) | seed2: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 3 x 100 rounds | (e) | seed3: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 4 x 100 rounds | (e) | seed4: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 5 x 100 rounds | (e) | seed5: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 6 x 100 rounds | (e) | seed6: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 7 x 100 rounds | (e) | seed7: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 8 x 100 rounds | (e) | seed8: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+sim-seeds.test.js | seed 9 x 100 rounds | (e) | seed9: ops never completed: extend_node:C#0,extend_node:D#0,extend_node:A#0,extend_node:E#0
+static.test.js | no derived secrets (keys/seeds/IVs/nonces from hashes or public data) | A1 | secret from hash/public data:
+submit-result.test.js | extendSubmit records TransactionInfo.resultCode from the multisign result | (e) | context/EvernodeContext.ts:374: extendSubmit did not record the multisign TransactionInfo (got undefined)
+two-extfail.test.js | twoExtfail: D and E extfail, landed[C] == 1 | (e) | context/ClusterContext.ts:172: twoExtfail landed[C] == 1, got 0; opsLeft=["extend_node:C#0"]
+two-extfail.test.js | twoExtfail: C is dequeued | (e) | context/ClusterContext.ts:172: twoExtfail expected C dequeued, opsLeft=["extend_node:C#0"]
+two-extfail.test.js | twoExtfail: aborts == 0 | (d)+(e) | processConsensusUserInputs is not a function
