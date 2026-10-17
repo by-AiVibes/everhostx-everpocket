@@ -79,15 +79,19 @@ function createVoteBus(publicKeys, feeds, options = {}) {
     const pending = [];
     const sent = new Set();
     const wire = [];
+    const savedForReplay = [];
     let prefillUsed = false;
     let nonUnlSent = false;
+    const withhold = new Set(options.withhold || []);
 
     function deliver(batch) {
         publicKeys.forEach((receiver, receiverIndex) => {
             const ordered = options.alignedDelivery ? batch : rotate(batch, receiverIndex);
             for (const item of ordered) {
-                if (feeds[receiver])
-                    feeds[receiver]({ publicKey: item.publicKey }, Buffer.from(item.message));
+                if (!feeds[receiver])
+                    continue;
+                const sender = item.undefinedSender ? undefined : { publicKey: item.publicKey, activeOn: 1 };
+                feeds[receiver](sender, Buffer.from(item.message));
             }
         });
     }
@@ -105,6 +109,11 @@ function createVoteBus(publicKeys, feeds, options = {}) {
 
     return {
         wire,
+        replayStale() {
+            if (savedForReplay.length === 0)
+                return;
+            deliver(savedForReplay.map(item => ({ publicKey: item.publicKey, message: Buffer.from(item.message) })));
+        },
         send(publicKey, message) {
             const original = Buffer.from(message);
             wire.push(Buffer.from(original));
@@ -131,23 +140,54 @@ function createVoteBus(publicKeys, feeds, options = {}) {
                 }
             }
             sent.add(publicKey);
+            const acquireVote = vote && typeof vote.election === 'string'
+                && (vote.election.startsWith('acquire_key_contribution') || vote.election.startsWith('acquire_memo'));
             const dropMemo = vote && typeof vote.election === 'string' && vote.election.startsWith('acquire_memo')
                 && Array.isArray(options.dropMemo) && options.dropMemo.includes(senderIndex);
-            if (!dropMemo) {
-                pending.push({ publicKey, message: payload });
+            const dropWithheld = acquireVote && withhold.has(senderIndex);
+            if (options.lateReplay && vote && typeof vote.election === 'string' && vote.election.startsWith('acquire_key_contribution'))
+                savedForReplay.push({ publicKey, message: Buffer.from(payload) });
+            if (!dropMemo && !dropWithheld) {
+                const equivocate = options.equivocate && options.equivocate.index === senderIndex && vote
+                    && typeof vote.election === 'string' && vote.election.startsWith('acquire_key_contribution')
+                    && Array.isArray(options.equivocate.values);
+                if (equivocate) {
+                    for (const value of options.equivocate.values)
+                        pending.push({ publicKey, message: encodeVote({ ...vote, data: value }) });
+                } else {
+                    pending.push({ publicKey, message: payload });
+                }
                 const doublePhase = options.doubleVote && options.doubleVote.phase;
                 const doubleHere = options.doubleVote && options.doubleVote.index === senderIndex && vote && typeof vote.election === 'string'
                     && ((doublePhase === 'contribution' && vote.election.startsWith('acquire_key_contribution'))
                         || (doublePhase === 'memo' && vote.election.startsWith('acquire_memo')));
-                if (doubleHere)
+                if (doubleHere) {
+                    const second = Buffer.from(payload);
+                    if (options.doubleVote.different) {
+                        const parsed = parseVote(second);
+                        if (parsed)
+                            parsed.data = options.doubleVote.different;
+                        pending.push({ publicKey, message: parsed ? encodeVote(parsed) : second });
+                    } else {
+                        pending.push({ publicKey, message: second });
+                    }
+                }
+                if (options.duplicateAll && acquireVote)
                     pending.push({ publicKey, message: Buffer.from(payload) });
             }
             if (!nonUnlSent && vote && options.nonUnlContribution && typeof vote.election === 'string' && vote.election.startsWith('acquire_key_contribution')) {
                 nonUnlSent = true;
                 pending.push({
                     publicKey: options.nonUnlKey || 'f'.repeat(64),
-                    message: encodeVote({ ...vote, data: options.nonUnlContribution })
+                    message: encodeVote({ ...vote, data: options.nonUnlContribution }),
+                    undefinedSender: options.nonUnlUndefined === true
                 });
+                if (options.nonUnlAlsoUndefined)
+                    pending.push({
+                        publicKey: options.nonUnlKey || 'f'.repeat(64),
+                        message: encodeVote({ ...vote, data: options.nonUnlUndefinedContribution || options.nonUnlContribution }),
+                        undefinedSender: true
+                    });
             }
             if (sent.size === online.length)
                 flush();
@@ -388,6 +428,13 @@ function scratchIsWiped(ctx) {
     return true;
 }
 
+function partsAreWiped(ctx) {
+    const scratch = ctx.acquireKeyScratch;
+    if (!scratch || !Array.isArray(scratch.parts) || scratch.parts.length === 0)
+        return false;
+    return scratch.parts.every(part => Buffer.isBuffer(part) && isZero(part));
+}
+
 function ivAliasesKey(iv, key) {
     if (!key || key.length < iv.length)
         return false;
@@ -457,11 +504,65 @@ function captureStdio() {
     };
 }
 
+function shapeUnl(publicKeys, selfKey, config) {
+    const nodes = publicKeys.map(publicKey => ({ publicKey, activeOn: 1 }));
+    if (config.unlFault === 'empty')
+        return [];
+    if (config.unlFault === 'missing-self')
+        return nodes.filter(node => node.publicKey !== selfKey);
+    if (config.unlFault === 'malformed')
+        return [{ publicKey: 'not-an-ed-key', activeOn: 1 }].concat(nodes.slice(1));
+    if (config.unlFault === 'duplicate')
+        return nodes.concat([{ publicKey: nodes[0].publicKey, activeOn: 2 }]);
+    return nodes;
+}
+
+function installCipherLengthFault(config) {
+    if (!config.cipherLengthFault)
+        return () => { };
+    const fault = config.cipherLengthFault;
+    const secp = require('ripple-keypairs/dist/secp256k1');
+    const originalCreateHash = crypto.createHash;
+    const originalDerive = secp.derivePrivateKey;
+    if (fault === 'iv8') {
+        crypto.createHash = function (algorithm) {
+            const hash = originalCreateHash.call(crypto, algorithm);
+            if (algorithm !== 'sha256')
+                return hash;
+            const originalDigest = hash.digest.bind(hash);
+            hash.digest = function () {
+                const out = originalDigest();
+                return out.length === 32 ? out.subarray(0, 8) : out;
+            };
+            return hash;
+        };
+    }
+    if (fault === 'key33' || fault === 'key31') {
+        secp.derivePrivateKey = function () {
+            const scalar = originalDerive.apply(secp, arguments);
+            const originalToArrayLike = scalar.toArrayLike.bind(scalar);
+            scalar.toArrayLike = function () {
+                const full = originalToArrayLike(Buffer, 'be', 32);
+                if (fault === 'key33')
+                    return Buffer.concat([Buffer.from([0xed]), full]);
+                return full.subarray(0, 31);
+            };
+            return scalar;
+        };
+    }
+    return () => {
+        crypto.createHash = originalCreateHash;
+        secp.derivePrivateKey = originalDerive;
+    };
+}
+
 async function buildCluster(config, ledger, definitions) {
     const nodeCount = config.nodeCount;
     const publicKeys = [];
-    for (let index = 0; index < nodeCount; index++)
-        publicKeys.push(crypto.randomBytes(32).toString('hex'));
+    for (let index = 0; index < nodeCount; index++) {
+        const body = crypto.randomBytes(32).toString('hex');
+        publicKeys.push(config.bareUnlKeys ? body : ('ed' + body));
+    }
     publicKeys.sort();
     const feeds = {};
     const prefill = Array.isArray(config.prefillContributions) ? publicKeys.map((publicKey, index) => ({
@@ -481,7 +582,14 @@ async function buildCluster(config, ledger, definitions) {
         doubleVote: config.doubleVote,
         nonUnlContribution: config.nonUnlContribution,
         nonUnlKey: config.nonUnlKey,
+        nonUnlUndefined: config.nonUnlUndefined,
+        nonUnlAlsoUndefined: config.nonUnlAlsoUndefined,
+        nonUnlUndefinedContribution: config.nonUnlUndefinedContribution,
         alignedDelivery: config.alignedDelivery,
+        withhold: config.withhold,
+        equivocate: config.equivocate,
+        duplicateAll: config.duplicateAll,
+        lateReplay: config.lateReplay,
         prefill
     });
     const helper = createXrplHelper(definitions);
@@ -502,17 +610,24 @@ async function buildCluster(config, ledger, definitions) {
     const nodes = [];
 
     for (let index = 0; index < nodeCount; index++) {
+        const selfKey = publicKeys[index];
         const contractContext = {
-            publicKey: publicKeys[index],
+            publicKey: selfKey,
             contractId: 'acquire-cluster',
             lclSeqNo: 42,
             lclHash: config.lclHash,
             timestamp: 1,
             unl: {
-                list: () => publicKeys.map(publicKey => ({ publicKey })),
-                send: (message) => bus.send(publicKeys[index], message)
+                send: (message) => bus.send(selfKey, message)
             }
         };
+        if (config.unlFault !== 'absent') {
+            contractContext.unl.list = () => {
+                if (config.unlFault === 'throw')
+                    throw new Error(config.unlFaultMessage || 'contract unl failed');
+                return shapeUnl(publicKeys, selfKey, config);
+            };
+        }
         const hp = new HotPocketContext(contractContext);
         feeds[publicKeys[index]] = (sender, message) => hp.voteContext.feedUnlMessage(sender, message);
         const xrpl = new XrplContext(hp, TENANT_ADDRESS, null, {});
@@ -531,7 +646,17 @@ async function buildCluster(config, ledger, definitions) {
 
     for (const node of nodes) {
         node.xrpl.multiSigner.setSigner(node.signerKey);
-        node.xrpl.signerListInfo = signerListInfo;
+        node.xrpl.xrplAcc.getAccountObjects = async () => [{
+            LedgerEntryType: 'SignerList',
+            SignerQuorum: signerListInfo.signerQuorum,
+            SignerEntries: signerList.map(signer => ({
+                SignerEntry: {
+                    Account: signer.account,
+                    SignerWeight: signer.weight
+                }
+            }))
+        }];
+        await node.xrpl.loadSignerList();
         node.evernode = new EvernodeContext(node.xrpl);
     }
     return { nodes, bus, publicKeys };
@@ -570,8 +695,12 @@ async function run(config) {
         contexts = cluster.nodes.map(node => node.evernode);
         const offline = new Set(config.offline || []);
         const roundCount = config.rounds || 1;
+        const restoreCipherFault = installCipherLengthFault(config);
         for (let round = 0; round < roundCount; round++) {
+            if (round > 0 && config.lateReplay)
+                cluster.bus.replayStale();
             const beforeLanded = ledger.landed.length;
+            const beforeWire = cluster.bus.wire.length;
             const beforeSubmitted = ledger.submissions.length;
             const outcomes = await Promise.all(cluster.nodes.map(async (node, index) => {
                 if (offline.has(index))
@@ -624,9 +753,11 @@ async function run(config) {
                 hashes: outcomes.map(outcome => outcome.hash),
                 landed: landedNow.length,
                 memo,
-                plain
+                plain,
+                contributions: readContributions(cluster.bus.wire.slice(beforeWire))
             });
         }
+        restoreCipherFault();
 
         const contributions = readContributions(cluster.bus.wire);
         const persisted = persistedState(contexts);
@@ -686,6 +817,7 @@ async function run(config) {
             rounds,
             contributions,
             scratchZero: contexts.every(scratchIsWiped),
+            partsZero: contexts.every(partsAreWiped),
             keyFound,
             ivIsSliceOfEphemeralKey,
             pubDerivedFromIv,
