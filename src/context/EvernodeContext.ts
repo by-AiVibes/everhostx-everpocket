@@ -24,14 +24,70 @@ const ACQUIRE_IV_DOMAIN = Buffer.from('everpocket-acquire-iv-v1');
 const ACQUIRE_KEY_DOMAIN = Buffer.from('everpocket-acquire-ephemeral-v1');
 const SECP256K1_ORDER = Buffer.from('fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141', 'hex');
 
+/**
+ * Acquire elections wait for one vote from every UNL sender, or for the deadline.
+ * Message count is not a quorum: a sender outside the UNL is ignored and a second
+ * vote from the same sender is a double vote. Other elections keep AllVoteElector.
+ */
+class AcquireUnlVoteElector extends AllVoteElector {
+    private unlKeys: Set<string>;
+
+    public constructor(publicKeys: string[], timeout: number) {
+        super(publicKeys.length, timeout);
+        this.unlKeys = new Set(publicKeys);
+    }
+
+    public election(electionName: string, voteEmitter: any, context: any): Promise<any[]> {
+        return new Promise((resolve) => {
+            let settled = false;
+            let scheduled = false;
+            const finish = () => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(context.resolveVotes(electionName));
+            };
+            const timer = setTimeout(finish, this.timeout);
+            const consider = () => {
+                const collected = context.voteCollection && context.voteCollection[electionName];
+                if (!Array.isArray(collected))
+                    return;
+                const seen = new Map<string, number>();
+                for (const vote of collected) {
+                    const publicKey = vote && vote.sender && vote.sender.publicKey;
+                    if (!publicKey || !this.unlKeys.has(publicKey))
+                        continue;
+                    seen.set(publicKey, (seen.get(publicKey) || 0) + 1);
+                }
+                const doubled = Array.from(seen.values()).some(count => count > 1);
+                if (doubled || seen.size === this.unlKeys.size)
+                    finish();
+            };
+            voteEmitter.on(electionName, () => {
+                if (settled || scheduled)
+                    return;
+                scheduled = true;
+                // The NPL delivery loop is synchronous. Decide after this turn so a
+                // batch is not cut off at the Nth message.
+                setTimeout(() => {
+                    scheduled = false;
+                    if (!settled)
+                        consider();
+                }, 0);
+            });
+        });
+    }
+}
+
 class EvernodeContext {
     private acquireDataFile: string = "acquires.json";
     private acquireData: AcquireData = { acquiredNodes: [], pendingAcquires: [] };
     private registryClient: any;
     private updatedData: boolean = false;
     private initialized: boolean = false;
-    // Holds the acquire IV, ephemeral key, and this node's contribution until submit, then wiped.
-    private acquireKeyScratch: { iv: Buffer; ephemPrivateKey: Buffer; contribution: Buffer | null } | null = null;
+    // Same buffers passed to the cipher. finally wipes them; try locals would not survive a throw.
+    private acquireKeyScratch: { iv: Buffer; ephemPrivateKey: Buffer; contribution: Buffer | null; parts: Buffer[]; contributors: string[] } | null = null;
     public hpContext: HotPocketContext;
     public xrplContext: XrplContext;
     public voteContext: VoteContext;
@@ -369,15 +425,36 @@ class EvernodeContext {
 
         try {
             // lclHash is public consensus data, so it cannot seed the cipher.
-            // The NPL/UNL vote channel is plaintext JSON, so the IV and key are not
-            // sent on it either. Each node contributes CSPRNG bytes. Every node
-            // sorts those contributions and hashes them into one IV and one key.
+            // Peer links are hpws TLS 1.2+ with a self-signed per-node cert
+            // (hpws.c SSL_CTX_set_min_proto_version TLS1_2; comm_server.hpp
+            // hpws::server::create; peer_comm_server.cpp hpws::client::connect;
+            // conf.cpp tlskey.pem/tlscert.pem). NplChannel.send and the JSON vote
+            // encoding are the local contract-to-hpcore pipe, not the wire.
+            // Passive outsiders cannot read contributions. hpws never verifies
+            // certs (no SSL_set_verify), so an active MITM is not ruled out.
+            // Every UNL node and its host operator sees every contribution and can
+            // recompute the IV and key and decrypt the memo. NPL mode "public"
+            // also delivers contributions to connected non-UNL peers; the default
+            // is private. The memo carries the owner pubkey, contract id, image,
+            // config, and tenant messageKey.
+            // Distinct UNL senders vote until all n have voted or the deadline.
+            // At least ceil(2n/3) contributions, and the same number of identical
+            // memo votes committed to that contributor set, are required. Below
+            // that, or on a double vote, the acquire aborts before multisign.
+            // There is no commit-reveal: the last sender can bias its own bytes.
+            // It cannot choose the key. Contribution votes are hex strings and
+            // cannot be wiped; the Buffer copies passed to the cipher are wiped.
             const timeout = this.#acquireVoteTimeout(options);
             const material = await this.#agreeAcquireKeyMaterial(timeout);
-            this.#assertAcquireKeyMaterial(material.iv, material.ephemPrivateKey);
             this.acquireKeyScratch = material;
-            const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(hostAddress, { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messageKey }, { leaseOfferIndex: leaseOffer.index, iv: material.iv, ephemPrivateKey: material.ephemPrivateKey });
-            await this.#rejectMismatchedAcquireMemo(preparedAcquireTxn, timeout);
+            const cipherOptions: { leaseOfferIndex: string; iv?: Buffer; ephemPrivateKey?: Buffer } = {
+                leaseOfferIndex: leaseOffer.index,
+                iv: this.acquireKeyScratch.iv,
+                ephemPrivateKey: this.acquireKeyScratch.ephemPrivateKey
+            };
+            this.#assertAcquireKeyMaterial(cipherOptions.iv, cipherOptions.ephemPrivateKey);
+            const preparedAcquireTxn = await tenantClient.prepareAcquireLeaseTransaction(hostAddress, { ...(JSONHelpers.castFromModel(options.instanceCfg)), messageKey: messageKey }, cipherOptions);
+            await this.#rejectMismatchedAcquireMemo(preparedAcquireTxn, material.contributors, timeout);
             return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
         } finally {
             this.#wipeAcquireKeyScratch();
@@ -394,15 +471,16 @@ class EvernodeContext {
     }
 
     /**
-     * UNL members that will build this acquire, or an empty list when this
-     * process has no vote channel (a single signer builds the transaction alone).
+     * UNL members that will build this acquire. A single signer (fewer than two)
+     * draws the IV and key locally instead of opening a vote.
      */
     #acquireUnl(): { publicKey: string }[] {
-        const getter = this.hpContext && this.hpContext.getContractUnl;
-        if (typeof getter !== 'function')
-            return [];
-        const listed = getter.call(this.hpContext);
+        const listed = this.hpContext.getContractUnl();
         return Array.isArray(listed) ? listed : [];
+    }
+
+    #acquireThreshold(unlSize: number): number {
+        return Math.ceil((2 * unlSize) / 3);
     }
 
     #isSecp256k1Scalar(key: Buffer): boolean {
@@ -420,38 +498,77 @@ class EvernodeContext {
 
     /**
      * Agree an IV and ephemeral key.
-     * With two or more voting nodes, hash the sorted contributions.
+     * With two or more UNL nodes, hash the contributions of the distinct senders
+     * that voted by the deadline, if at least ceil(2n/3) of them did.
      * Alone, draw both values from the CSPRNG. Callers must wipe the buffers.
      */
-    async #agreeAcquireKeyMaterial(timeout: number): Promise<{ iv: Buffer; ephemPrivateKey: Buffer; contribution: Buffer | null }> {
+    async #agreeAcquireKeyMaterial(timeout: number): Promise<{ iv: Buffer; ephemPrivateKey: Buffer; contribution: Buffer | null; parts: Buffer[]; contributors: string[] }> {
         const unl = this.#acquireUnl();
-        if (unl.length < 2 || typeof this.voteContext?.vote !== 'function') {
+        if (unl.length < 2) {
             return {
                 iv: randomBytes(ACQUIRE_IV_LENGTH),
                 ephemPrivateKey: this.#randomSecp256k1Scalar(),
-                contribution: null
+                contribution: null,
+                parts: [],
+                contributors: []
             };
         }
 
         const contribution = randomBytes(ACQUIRE_CONTRIBUTION_LENGTH);
         const electionName = `acquire_key_contribution${this.voteContext.getUniqueNumber()}`;
-        const votes = await this.voteContext.vote(electionName, [contribution.toString('hex')], new AllVoteElector(unl.length, timeout));
-        if (!Array.isArray(votes) || votes.length !== unl.length)
-            throw new Error('acquire key agreement did not collect a contribution from every node');
+        const votes = await this.voteContext.vote(electionName, [contribution.toString('hex')], new AcquireUnlVoteElector(unl.map(node => node.publicKey), timeout));
+        const accepted = this.#acceptedAcquireVotes(votes, unl);
+        if (accepted.length < this.#acquireThreshold(unl.length))
+            throw new Error('acquire key agreement below threshold');
 
         const parts: Buffer[] = [];
-        for (const vote of votes) {
-            const part = Buffer.from(String(vote.data), 'hex');
-            if (part.length !== ACQUIRE_CONTRIBUTION_LENGTH)
-                throw new Error('acquire key contribution must be 32 bytes');
-            parts.push(part);
+        const contributors: string[] = [];
+        try {
+            for (const vote of accepted) {
+                const part = Buffer.from(String(vote.data), 'hex');
+                if (part.length !== ACQUIRE_CONTRIBUTION_LENGTH)
+                    throw new Error('acquire key contribution must be 32 bytes');
+                parts.push(part);
+                contributors.push(vote.publicKey);
+            }
+            const derived = this.#deriveAcquireKeyMaterial(parts);
+            return { iv: derived.iv, ephemPrivateKey: derived.ephemPrivateKey, contribution, parts, contributors };
+        } catch (error) {
+            for (const part of parts)
+                part.fill(0);
+            contribution.fill(0);
+            throw error;
         }
-        // Arrival order differs per node. Sort so every node hashes the same bytes.
-        parts.sort((left, right) => Buffer.compare(left, right));
-        const derived = this.#deriveAcquireKeyMaterial(parts);
-        for (const part of parts)
-            part.fill(0);
-        return { iv: derived.iv, ephemPrivateKey: derived.ephemPrivateKey, contribution };
+    }
+
+    /**
+     * One vote per UNL public key, sorted by that key. A second vote from the
+     * same sender aborts. Senders outside the UNL are ignored and logged.
+     */
+    #acceptedAcquireVotes(votes: any[], unl: { publicKey: string }[]): { publicKey: string; data: any }[] {
+        const allowed = new Set(unl.map(node => node.publicKey));
+        const bySender = new Map<string, any[]>();
+        for (const vote of (Array.isArray(votes) ? votes : [])) {
+            const publicKey = vote && vote.sender && vote.sender.publicKey;
+            if (!publicKey || !allowed.has(publicKey)) {
+                if (publicKey)
+                    log(`acquire vote ignored from non-unl sender ${publicKey}`);
+                continue;
+            }
+            const group = bySender.get(publicKey);
+            if (group)
+                group.push(vote);
+            else
+                bySender.set(publicKey, [vote]);
+        }
+        for (const group of bySender.values()) {
+            if (group.length > 1)
+                throw new Error('acquire vote rejected: double vote');
+        }
+        return Array.from(bySender.keys()).sort().map(publicKey => {
+            const group = bySender.get(publicKey) || [];
+            return { publicKey, data: group[0].data };
+        });
     }
 
     /**
@@ -472,34 +589,38 @@ class EvernodeContext {
         return { iv, ephemPrivateKey: keyCopy };
     }
 
-    #assertAcquireKeyMaterial(iv: Buffer, ephemPrivateKey: Buffer): void {
-        if (iv.length !== ACQUIRE_IV_LENGTH)
+    #assertAcquireKeyMaterial(iv: Buffer | undefined, ephemPrivateKey: Buffer | undefined): void {
+        if (!iv || iv.length !== ACQUIRE_IV_LENGTH)
             throw new Error(`acquire IV must be ${ACQUIRE_IV_LENGTH} bytes`);
-        if (!this.#isSecp256k1Scalar(ephemPrivateKey))
+        if (!ephemPrivateKey || !this.#isSecp256k1Scalar(ephemPrivateKey))
             throw new Error(`acquire ephemeral key must be a ${ACQUIRE_KEY_LENGTH}-byte secp256k1 scalar`);
     }
 
     /**
-     * Every node encrypts locally. Abort before multisign unless every memo matches.
+     * Proceed only when ceil(2n/3) distinct UNL nodes vote this exact memo and
+     * the same contributor set. Otherwise abort before multisign.
      */
-    async #rejectMismatchedAcquireMemo(transaction: any, timeout: number): Promise<void> {
+    async #rejectMismatchedAcquireMemo(transaction: any, contributors: string[], timeout: number): Promise<void> {
         const unl = this.#acquireUnl();
-        if (unl.length < 2 || typeof this.voteContext?.vote !== 'function')
+        if (unl.length < 2)
             return;
         if (!Array.isArray(transaction?.Memos) || transaction.Memos.length === 0)
             throw new Error('acquire transaction is missing its memo');
 
-        const memo = Buffer.from(JSON.stringify(transaction.Memos));
+        const payload = JSON.stringify({
+            memo: Buffer.from(JSON.stringify(transaction.Memos)).toString('hex'),
+            contributors
+        });
         const electionName = `acquire_memo${this.voteContext.getUniqueNumber()}`;
-        const votes = await this.voteContext.vote(electionName, [memo.toString('hex')], new AllVoteElector(unl.length, timeout));
-        if (!Array.isArray(votes) || votes.length !== unl.length)
-            throw new Error('acquire memo agreement did not collect a memo from every node');
-
-        const expected = memo.toString('hex');
-        for (const vote of votes) {
-            if (vote.data !== expected)
-                throw new Error('acquire memo mismatch');
+        const votes = await this.voteContext.vote(electionName, [payload], new AcquireUnlVoteElector(unl.map(node => node.publicKey), timeout));
+        const accepted = this.#acceptedAcquireVotes(votes, unl);
+        let matched = 0;
+        for (const vote of accepted) {
+            if (vote.data === payload)
+                matched += 1;
         }
+        if (matched < this.#acquireThreshold(unl.length))
+            throw new Error('acquire memo agreement below threshold');
     }
 
     #wipeAcquireKeyScratch(): void {
@@ -511,6 +632,8 @@ class EvernodeContext {
         scratch.iv.fill(0);
         if (scratch.contribution)
             scratch.contribution.fill(0);
+        for (const part of scratch.parts)
+            part.fill(0);
     }
 
     /**
