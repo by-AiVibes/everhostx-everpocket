@@ -194,9 +194,29 @@ describe('acquire key material comes from a CSPRNG', { concurrency: 1 }, () => {
 });
 
 function newContext(lclHash) {
+    // R1 exception: the locked context had no node-set source. Production reads
+    // HotPocketContext.getContractUnl(), and a missing-UNL fallback is forbidden.
+    const HotPocketContext = require('../../dist/context/HotPocketContext').default;
+    const publicKey = 'ed' + '11'.repeat(32);
+    let hp;
+    const contractContext = {
+        publicKey: publicKey,
+        contractId: 'dc411912-bcdd-4f73-af43-32ec45844b9a',
+        lclSeqNo: 42,
+        lclHash: lclHash,
+        timestamp: 1,
+        unl: {
+            list: () => [{ publicKey: publicKey, activeOn: 1 }],
+            send: (message) => {
+                hp.voteContext.feedUnlMessage({ publicKey: publicKey, activeOn: 1 }, Buffer.from(message));
+                return Promise.resolve();
+            }
+        }
+    };
+    hp = new HotPocketContext(contractContext);
     return new EvernodeContext({
-        hpContext: { lclHash, lclSeqNo: 42 },
-        voteContext: {},
+        hpContext: hp,
+        voteContext: hp.voteContext,
         xrplApi: stubApi,
         xrplAcc: { address: TENANT_ADDRESS },
         async multiSignAndSubmitTransaction(transaction) {
