@@ -28,6 +28,8 @@ import {
     ensurePinnedExtendTx,
     findInFlightExtendRef,
     getPinnedExtendTx,
+    quorumExtendCompletesOp,
+    quorumExtendFieldsAgree,
 } from "../cluster/ExtendPinning";
 const DUMMY_OWNER_PUBKEY = "dummy_owner_pubkey";
 const SASHIMONO_NODEJS_IMAGE = "evernodedev/sashimono:hp.0.6.4-ubt.20.04-njs.20";
@@ -356,6 +358,14 @@ class ClusterContext {
         }
         this.updatedData = true;
 
+        if (
+            quorumExtendFieldsAgree(this.operationData, operation)
+            && !quorumExtendCompletesOp(this.operationData, operation)
+        ) {
+            log(`Extend op ${operation.ref} waiting: quorum agreed, consumption pending`);
+            return 'skipped';
+        }
+
         const seq = pin.sequence;
         if (this.operationData.consumedTenantSequences?.includes(seq))
             return 'skipped';
@@ -369,8 +379,12 @@ class ClusterContext {
             tenantAddress,
             sequenceLedgerIndex,
         );
-        if (onLedgerSeq === null || onLedgerSeq > seq)
+        if (onLedgerSeq === null)
             return 'skipped';
+        if (onLedgerSeq > seq) {
+            if (quorumExtendFieldsAgree(this.operationData, operation))
+                return 'skipped';
+        }
 
         const data = operation.data as ExtendNodeOperation;
         const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
@@ -434,7 +448,7 @@ class ClusterContext {
                 continue;
 
             const nextAttempt = operationNextAttemptLcl(operation);
-            if (nextAttempt !== undefined && nextAttempt > curLcl)
+            if (!this.operationData.anchorQuorumStalled && nextAttempt !== undefined && nextAttempt > curLcl)
                 continue;
 
             if (operationAttempt(operation) >= MAX_OPERATION_ATTEMPTS) {

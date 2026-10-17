@@ -92,6 +92,10 @@ export interface OperationData {
   operations: Operation[];
   /** Agreed Xahau ledger anchor; advances via consensus observation quorum (see docs/queue-agreed-state.md). */
   anchorLedger?: number;
+  /** True when quorum agrees on validated index but not ledger hash (e.g. hash liar). */
+  anchorQuorumStalled?: boolean;
+  /** Quorum-agreed tenant sequence from observations (consumption when anchor quorum is stalled). */
+  observedTenantSequenceQuorum?: number;
   agreedLedgerHash?: string;
   agreedTenantSequence?: number;
   agreedSignerListHash?: string;

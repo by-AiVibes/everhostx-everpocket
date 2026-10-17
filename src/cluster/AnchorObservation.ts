@@ -125,6 +125,27 @@ function resolveExtendOpRef(operationData: OperationData | undefined, txRef: str
     return txRef;
 }
 
+function maxNumericValueWithQuorumDistinctUnl(
+    observations: ParsedObservation[],
+    valueFn: (o: ParsedObservation) => number,
+    quorum: number,
+): number | null {
+    const valueToUnl = new Map<number, Set<string>>();
+    for (const o of observations) {
+        const v = valueFn(o);
+        const unl = o.unlPubkey.toLowerCase();
+        if (!valueToUnl.has(v))
+            valueToUnl.set(v, new Set());
+        valueToUnl.get(v)!.add(unl);
+    }
+    let best: number | null = null;
+    for (const [v, unls] of valueToUnl) {
+        if (unls.size >= quorum && (best === null || v > best))
+            best = v;
+    }
+    return best;
+}
+
 function modeWithQuorumDistinctUnl(
     observations: ParsedObservation[],
     valueFn: (o: ParsedObservation) => string,
@@ -171,6 +192,26 @@ export function normalizeObservationCheckpoints(msg: AnchorObservationPayload): 
 
 export function isObservationStale(observedLcl: number, currentLcl: number, maxInputLedgerOffset: number): boolean {
     return observedLcl < currentLcl - maxInputLedgerOffset;
+}
+
+function pluralityValidatedIndex(observations: ParsedObservation[], quorum: number): number | null {
+    const indexUnls = new Map<number, Set<string>>();
+    for (const o of observations) {
+        const unl = o.unlPubkey.toLowerCase();
+        if (!indexUnls.has(o.validatedIndex))
+            indexUnls.set(o.validatedIndex, new Set());
+        indexUnls.get(o.validatedIndex)!.add(unl);
+    }
+    let anchorIndex: number | null = null;
+    let bestCount = 0;
+    for (const [index, unls] of indexUnls) {
+        const count = unls.size;
+        if (count >= quorum && count > bestCount) {
+            anchorIndex = index;
+            bestCount = count;
+        }
+    }
+    return anchorIndex;
 }
 
 export function acceptObservationDedup(
@@ -371,6 +412,35 @@ export function applyObservationInputs(params: ApplyObservationInputsParams): Pa
     }
 
     const quorum = quorumThreshold(contractUnl.length);
+    const unlSet = new Set(contractUnl.map((k) => k.toLowerCase()));
+    const fromUnl = accepted.filter((o) => unlSet.has(o.unlPubkey.toLowerCase()));
+    const pluralityIndex = pluralityValidatedIndex(fromUnl, quorum);
+    const tenantObsQuorum = operationData.anchorQuorumStalled && quorum > 1
+        ? quorum - 1
+        : quorum;
+    const tenantSeq = maxNumericValueWithQuorumDistinctUnl(
+        fromUnl,
+        (o) => o.tenantSequence,
+        tenantObsQuorum,
+    );
+    if (tenantSeq !== null) {
+        const prevObserved = operationData.observedTenantSequenceQuorum !== undefined
+            ? operationData.observedTenantSequenceQuorum
+            : 0;
+        if (tenantSeq > prevObserved)
+            operationData.observedTenantSequenceQuorum = tenantSeq;
+    }
+    const atPlurality = pluralityIndex !== null
+        ? fromUnl.filter((o) => o.validatedIndex === pluralityIndex)
+        : [];
+    const hashDispute = pluralityIndex !== null
+        && atPlurality.length >= quorum
+        && new Set(atPlurality.map((o) => o.ledgerHash)).size > 1;
+    if (hashDispute)
+        operationData.anchorQuorumStalled = true;
+    else
+        delete operationData.anchorQuorumStalled;
+
     const result = aggregateAnchorFromObservations(accepted, contractUnl);
     if (result) {
         const prev = operationData.anchorLedger !== undefined ? operationData.anchorLedger : 0;
