@@ -14,7 +14,8 @@
         "bundle": "npm run build && ./clean-pkg.sh",
         "publish": "npm run bundle && cp npm-readme.md dist/README.md && npm publish ./dist",
         "test": "npm run build && npm --prefix test i &&  npm --prefix test start",
-        "test:unit": "npm run build && node --test --test-concurrency=2 test/unit/*.test.js"
+        "test:unit": "npm run build && node --test --test-concurrency=2 test/unit/*.test.js",
+        "test:gate": "node --test --test-concurrency=2 test/gate/*.test.js"
     },
     "dependencies": {
         "@typescript-eslint/parser": "7.18.0",
