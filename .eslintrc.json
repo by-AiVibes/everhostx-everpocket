@@ -11,6 +11,11 @@
     },
     "rules": {
         "no-async-promise-executor": "off",
-        "no-unused-vars": "off"
+        "no-unused-vars": "off",
+        "no-restricted-properties": ["error", {
+            "object": "Math",
+            "property": "random",
+            "message": "Use crypto.randomBytes instead of Math.random."
+        }]
     }
 }
