@@ -242,7 +242,7 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
         assertNoSecrets(memoSplit, 'memo mismatch');
 
         const unavailable = runCluster({ nodeCount: 3, unlFault: 'empty', voteTimeout: 300 });
-        assertAborted(unavailable, /acquire consensus unavailable/);
+        assertAborted(unavailable, /acquire UNL unavailable/);
         assertNoSecrets(unavailable, 'UNL unavailable');
 
         const shortIv = runCluster({ nodeCount: 1, cipherLengthFault: 'iv8', voteTimeout: 300 });
@@ -279,7 +279,7 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
 
     test('an empty UNL fails closed with 0 attempts', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'empty', voteTimeout: 300 });
-        assertAborted(report, /acquire consensus unavailable/);
+        assertAborted(report, /acquire UNL unavailable/);
         assertNoContributionVote(report);
     });
 
@@ -291,19 +291,19 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
 
     test('a UNL without this node fails closed', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'missing-self', voteTimeout: 300 });
-        assertAborted(report, /acquire consensus unavailable/);
+        assertAborted(report, /acquire UNL unavailable/);
         assertNoContributionVote(report);
     });
 
     test('a malformed UNL key fails closed', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'malformed', voteTimeout: 300 });
-        assertAborted(report, /acquire consensus unavailable/);
+        assertAborted(report, /acquire UNL unavailable/);
         assertNoContributionVote(report);
     });
 
     test('a duplicate UNL entry fails closed', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'duplicate', voteTimeout: 300 });
-        assertAborted(report, /acquire consensus unavailable/);
+        assertAborted(report, /acquire UNL unavailable/);
         assertNoContributionVote(report);
     });
 
@@ -475,7 +475,7 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
 
     test('the same UNL key in two cases fails closed', () => {
         const report = runCluster({ nodeCount: 3, unlFault: 'case-duplicate', voteTimeout: 300 });
-        assertAborted(report, /acquire consensus unavailable/);
+        assertAborted(report, /acquire UNL unavailable/);
         assertNoContributionVote(report);
     });
 
@@ -491,6 +491,20 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
         const expected = deriveMaterial(report.publicKeys, contributions);
         assert.equal(report.rounds[0].memo.pub, expected.pub.toString('hex'));
         assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
+    });
+
+    test('mixed-case sender keys are ordered by their lowercase identity', () => {
+        const contributions = [C0, C1, C2];
+        const report = runCluster({
+            nodeCount: 3,
+            fixedContributions: contributions,
+            mixedCaseSender: true,
+            voteTimeout: 400
+        });
+        assertLanded(report, 3);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.iv === expected.iv.toString('hex'), true, 'mixed-case senders must be ordered by lowercase identity');
+        assert.equal(report.rounds[0].memo.pub === expected.pub.toString('hex'), true, 'mixed-case senders must not change the ephemeral pubkey');
     });
 
     test('upper-case sender keys still count toward the UNL', () => {
@@ -559,6 +573,116 @@ describe('acquire votes are per sender and live at ceil(2n/3)', { concurrency: 1
         assert.equal(report.rounds[0].memo.iv, expected.iv.toString('hex'));
         assert.equal(report.rounds[0].plain.messageKey, report.messageKey);
     });
+
+    test('a throwing tenant client does not stick the in-flight guard', () => {
+        const contributions = [C0];
+        const report = runCluster({
+            nodeCount: 1,
+            rounds: 2,
+            fixedContributions: contributions,
+            failFirstTenantClient: true,
+            voteTimeout: 400
+        });
+        assert.equal(report.landed, 1, `the second acquire must land, got ${report.landed} (${(report.errors || []).slice(0, 2).join(' | ')})`);
+        assert.equal(report.attempts, 1, `only the second acquire must reach the ledger, got ${report.attempts}`);
+        assert.match((report.errors || []).join('\n'), /tenant client construction failed/);
+        assert.equal(report.inFlightClear, true, 'the in-flight flag must be clear after the constructor throw');
+        const landedRound = (report.rounds || []).find(round => round && round.memo);
+        assert.ok(landedRound, 'the second acquire must submit a memo');
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(landedRound.memo.iv === expected.iv.toString('hex'), true, 'the landed memo must match the known-answer IV');
+        assert.equal(landedRound.memo.pub === expected.pub.toString('hex'), true, 'the landed memo must match the known-answer pubkey');
+    });
+
+    test('library-boundary originals are zero after a landed acquire', () => {
+        for (const nodeCount of [3, 1]) {
+            const contributions = nodeCount === 1 ? [C0] : [C0, C1, C2];
+            const report = runCluster({
+                nodeCount,
+                fixedContributions: contributions,
+                observeCrypto: true,
+                voteTimeout: 300
+            });
+            assertLanded(report, nodeCount);
+            const zeros = report.cryptoObservations.originalsZero;
+            assert.equal(zeros.joined, true, `joined original must be zero for n=${nodeCount}`);
+            assert.equal(zeros.seed, true, `seed original must be zero for n=${nodeCount}`);
+            assert.equal(zeros.ivHash, true, `ivHash original must be zero for n=${nodeCount}`);
+        }
+    });
+
+    test('library-boundary originals are zero when memo agreement aborts', () => {
+        const report = runCluster({
+            nodeCount: 3,
+            tamperMemoSets: true,
+            observeCrypto: true,
+            voteTimeout: 300
+        });
+        assertAborted(report, /acquire memo agreement below threshold/);
+        const zeros = report.cryptoObservations.originalsZero;
+        assert.equal(zeros.joined, true, 'joined original must be zero when memo agreement aborts');
+        assert.equal(zeros.seed, true, 'seed original must be zero when memo agreement aborts');
+        assert.equal(zeros.ivHash, true, 'ivHash original must be zero when memo agreement aborts');
+    });
+
+    test('a short derived IV is rejected before the cipher', () => {
+        const report = runCluster({
+            nodeCount: 1,
+            ivLengthFault: 'short',
+            voteTimeout: 300
+        });
+        assert.match((report.errors || []).join('\n'), /acquire IV must be 16 bytes/);
+        assert.equal((report.uncaught || []).length, 0, 'a short IV must be rejected before the cipher raises');
+        assert.equal(report.inFlightClear, true, 'a short IV must clear the in-flight flag');
+        assert.equal(report.landed, 0);
+        assert.equal(report.attempts, 0);
+        assert.equal(report.timedOut, false, 'a short IV must reject inside the test bound');
+    });
+
+    test('an upper-case sender duplicate in a later turn still lands', () => {
+        const contributions = [C0, C1, C2];
+        const report = runCluster({
+            nodeCount: 3,
+            fixedContributions: contributions,
+            upperCaseSenders: true,
+            lateHonestDuplicate: 'contribution',
+            voteTimeout: 500
+        });
+        assertLanded(report, 3);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.iv === expected.iv.toString('hex'), true, 'a later duplicate must not change the memo IV');
+        assert.equal(report.rounds[0].memo.pub === expected.pub.toString('hex'), true, 'a later duplicate must not change the ephemeral pubkey');
+        assert.equal((report.uncaught || []).length, 0);
+    });
+
+    test('the cipher IV is not a view of the IV hash', () => {
+        const contributions = [C0];
+        const report = runCluster({
+            nodeCount: 1,
+            fixedContributions: contributions,
+            observeCrypto: true,
+            voteTimeout: 300
+        });
+        assertLanded(report, 1);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.iv === expected.iv.toString('hex'), true, 'a detached cipher IV must still match the known answer');
+        assert.equal(report.ivDetachedFromHash, true, 'cipher IV must not alias the IV hash');
+        assert.equal(report.rounds[0].plain == null, false, 'the real cipher must still decrypt');
+    });
+
+    test('an acquire that finishes is not a timeout', () => {
+        const contributions = [C0];
+        const report = runCluster({
+            nodeCount: 1,
+            fixedContributions: contributions,
+            voteTimeout: 300,
+            acquireDeadline: 5000
+        });
+        assertLanded(report, 1);
+        const expected = deriveMaterial(report.publicKeys, contributions);
+        assert.equal(report.rounds[0].memo.iv === expected.iv.toString('hex'), true, 'a finished acquire must match the known-answer IV');
+        assert.equal(report.rounds[0].memo.pub === expected.pub.toString('hex'), true, 'a finished acquire must match the known-answer pubkey');
+    });
 });
 
 function ledgerQuorum(nodeCount) {
@@ -580,7 +704,7 @@ function runCluster(config) {
     })], {
         cwd: workDir,
         encoding: 'utf8',
-        timeout: 20000
+        timeout: 60000
     });
     let report = null;
     if (fs.existsSync(resultPath))
@@ -593,6 +717,8 @@ function runCluster(config) {
     report.stdio.err += child.stderr || '';
     if (report.fatal)
         assert.fail(`cluster runner failed: ${report.fatal}`);
+    if (report.timedOut)
+        assert.fail('TIMEOUT: acquire did not finish');
     return report;
 }
 

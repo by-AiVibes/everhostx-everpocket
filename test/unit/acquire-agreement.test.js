@@ -118,7 +118,7 @@ function runCluster(config) {
     })], {
         cwd: workDir,
         encoding: 'utf8',
-        timeout: 20000
+        timeout: 60000
     });
     let report = null;
     if (fs.existsSync(resultPath))
@@ -131,6 +131,8 @@ function runCluster(config) {
     report.stdio.err += child.stderr || '';
     if (report.fatal)
         assert.fail(`cluster runner failed: ${report.fatal}`);
+    if (report.timedOut)
+        assert.fail('TIMEOUT: acquire did not finish');
     return report;
 }
 

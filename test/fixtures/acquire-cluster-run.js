@@ -112,9 +112,12 @@ function createVoteBus(publicKeys, feeds, options = {}) {
                 const phase = itemPhase(item);
                 if (phase === 'contribution' && missedContribution(receiverIndex, item.publicKey))
                     continue;
+                const senderIndex = indexOf.has(item.publicKey) ? indexOf.get(item.publicKey) : -1;
                 const senderKey = options.upperCaseSenders && typeof item.publicKey === 'string'
                     ? item.publicKey.toUpperCase()
-                    : item.publicKey;
+                    : (options.mixedCaseSender && senderIndex === publicKeys.length - 1 && typeof item.publicKey === 'string'
+                        ? item.publicKey.toUpperCase()
+                        : item.publicKey);
                 const sender = item.undefinedSender ? undefined : { publicKey: senderKey, activeOn: 1 };
                 feeds[receiver](sender, Buffer.from(item.message));
             }
@@ -154,6 +157,15 @@ function createVoteBus(publicKeys, feeds, options = {}) {
             // elector has already considered the non-UNL messages.
             deliver(noiseVotes(election, publicKeys.length));
             setTimeout(() => deliver(batch), 0);
+            return;
+        }
+        const duplicatePhase = options.lateHonestDuplicate;
+        if (phase && batch.length && (duplicatePhase === true || duplicatePhase === phase)) {
+            // The honest batch is one turn. One sender's second vote is the next
+            // turn, after the elector has considered the n distinct votes.
+            deliver(batch);
+            const extra = batch[0];
+            setTimeout(() => deliver([extra]), 0);
             return;
         }
         deliver(batch);
@@ -640,18 +652,134 @@ function installEphemeralKeyFault(config) {
     };
 }
 
+const IV_DOMAIN = Buffer.from('everpocket-acquire-iv-v1');
+
+function sawIvDomain(data) {
+    return Buffer.isBuffer(data) && data.length === IV_DOMAIN.length && data.equals(IV_DOMAIN);
+}
+
+function installIvLengthFault(config) {
+    if (config.ivLengthFault !== 'short')
+        return () => { };
+    const originalCreateHash = crypto.createHash;
+    crypto.createHash = function (algorithm) {
+        const hash = originalCreateHash.apply(crypto, arguments);
+        if (algorithm !== 'sha256')
+            return hash;
+        let updates = 0;
+        let track = false;
+        const originalUpdate = hash.update.bind(hash);
+        const originalDigest = hash.digest.bind(hash);
+        hash.update = function (data) {
+            updates += 1;
+            if (updates === 1 && sawIvDomain(data))
+                track = true;
+            return originalUpdate.apply(hash, arguments);
+        };
+        hash.digest = function () {
+            const out = originalDigest.apply(hash, arguments);
+            // Real digest, shortened. The length check sees these bytes.
+            if (track && Buffer.isBuffer(out) && out.length >= 8)
+                return out.subarray(0, 8);
+            return out;
+        };
+        return hash;
+    };
+    return () => {
+        crypto.createHash = originalCreateHash;
+    };
+}
+
+function installDerivedKeyLengthFault(config) {
+    const length = config.derivedKeyLength;
+    if (length !== 0 && length !== 31 && length !== 33 && length !== 64)
+        return () => { };
+    const secp = require('ripple-keypairs/dist/secp256k1');
+    const originalDerive = secp.derivePrivateKey;
+    secp.derivePrivateKey = function () {
+        const scalar = originalDerive.apply(secp, arguments);
+        const originalToArrayLike = scalar.toArrayLike.bind(scalar);
+        scalar.toArrayLike = function () {
+            const full = originalToArrayLike(Buffer, 'be', 32);
+            if (length === 0)
+                return Buffer.alloc(0);
+            if (length < 32)
+                return full.subarray(0, length);
+            if (length === 33)
+                return Buffer.concat([Buffer.from([0xed]), full]);
+            return Buffer.concat([full, full]);
+        };
+        return scalar;
+    };
+    return () => {
+        secp.derivePrivateKey = originalDerive;
+    };
+}
+
+function installTenantClientFault(config) {
+    if (!config.failFirstTenantClient)
+        return () => { };
+    const Original = evernode.TenantClient;
+    let used = false;
+    function FaultingTenantClient(...args) {
+        if (!used) {
+            used = true;
+            throw new Error('tenant client construction failed');
+        }
+        return new Original(...args);
+    }
+    FaultingTenantClient.prototype = Original.prototype;
+    evernode.TenantClient = FaultingTenantClient;
+    return () => {
+        evernode.TenantClient = Original;
+    };
+}
+
+function buffersAllZero(list) {
+    return Array.isArray(list) && list.length > 0 && list.every(buffer => Buffer.isBuffer(buffer) && buffer.length > 0 && isZero(buffer));
+}
+
 function installPassThroughObserver(config, record) {
     if (!config.observeCrypto)
         return () => { };
     const secp = require('ripple-keypairs/dist/secp256k1');
     const originalCreateHash = crypto.createHash;
     const originalDerive = secp.derivePrivateKey;
+    let expectAcquireSeed = false;
     crypto.createHash = function (algorithm) {
         record.hashes.push(algorithm);
-        return originalCreateHash.apply(crypto, arguments);
+        const hash = originalCreateHash.apply(crypto, arguments);
+        if (algorithm !== 'sha256')
+            return hash;
+        let updates = 0;
+        let track = false;
+        const originalUpdate = hash.update.bind(hash);
+        const originalDigest = hash.digest.bind(hash);
+        hash.update = function (data) {
+            updates += 1;
+            if (updates === 1 && sawIvDomain(data))
+                track = true;
+            else if (track && updates === 2 && Buffer.isBuffer(data))
+                record.joined.push(data);
+            return originalUpdate.apply(hash, arguments);
+        };
+        hash.digest = function () {
+            const out = originalDigest.apply(hash, arguments);
+            if (track && Buffer.isBuffer(out)) {
+                record.ivHashes.push(out);
+                // The acquire seed is the next derivePrivateKey argument.
+                expectAcquireSeed = true;
+            }
+            return out;
+        };
+        return hash;
     };
-    secp.derivePrivateKey = function () {
+    secp.derivePrivateKey = function (seed) {
         record.derives += 1;
+        if (expectAcquireSeed && Buffer.isBuffer(seed)) {
+            record.seeds.push(seed);
+            expectAcquireSeed = false;
+        }
         return originalDerive.apply(secp, arguments);
     };
     return () => {
@@ -697,7 +825,9 @@ async function buildCluster(config, ledger, definitions) {
         prefill,
         earlyNoise: config.earlyNoise,
         missContribution: config.missContribution,
-        upperCaseSenders: config.upperCaseSenders
+        upperCaseSenders: config.upperCaseSenders,
+        mixedCaseSender: config.mixedCaseSender,
+        lateHonestDuplicate: config.lateHonestDuplicate
     });
     const helper = createXrplHelper(definitions);
     const signerList = [];
@@ -790,11 +920,16 @@ async function run(config) {
         return originalPrepare.call(this, hostAddress, requirement, options);
     };
     const uncaught = [];
+    let notifyCipherRejection = null;
     const noteUncaught = (kind, error) => {
         uncaught.push({ kind, message: error && (error.message || String(error)) });
     };
     const onException = (error) => noteUncaught('uncaughtException', error);
-    const onRejection = (reason) => noteUncaught('unhandledRejection', reason);
+    const onRejection = (reason) => {
+        noteUncaught('unhandledRejection', reason);
+        if (notifyCipherRejection)
+            notifyCipherRejection(reason);
+    };
     if (config.recordUncaught !== false) {
         process.on('uncaughtException', onException);
         process.on('unhandledRejection', onRejection);
@@ -813,10 +948,14 @@ async function run(config) {
         contexts = cluster.nodes.map(node => node.evernode);
         const offline = new Set(config.offline || []);
         const roundCount = config.rounds || 1;
-        const cryptoObservations = { hashes: [], derives: 0 };
+        const cryptoObservations = { hashes: [], derives: 0, joined: [], seeds: [], ivHashes: [] };
         const restoreCipherFault = installCipherLengthFault(config);
         const restoreKeyFault = installEphemeralKeyFault(config);
+        const restoreIvFault = installIvLengthFault(config);
+        const restoreDerivedLength = installDerivedKeyLengthFault(config);
+        const restoreClientFault = installTenantClientFault(config);
         const restoreObserver = installPassThroughObserver(config, cryptoObservations);
+        let timedOut = false;
         for (let round = 0; round < roundCount; round++) {
             if (round > 0 && config.lateReplay)
                 cluster.bus.replayStale();
@@ -830,26 +969,42 @@ async function run(config) {
                 if (config.swapNode === index)
                     instanceCfg.ownerPubkey = `ed${'ab'.repeat(32)}`;
                 try {
-                    const acquireDeadline = config.acquireDeadline || Math.max(8000, (config.voteTimeout || 800) * 6);
+                    if (parentPort)
+                        parentPort.postMessage({ event: 'acquireSubmit' });
                     const pending = node.evernode.acquireSubmit(HOST_ADDRESS, leaseOffer(), messageKey, {
                         instanceCfg,
                         voteElectorOptions: { timeout: config.voteTimeout || 800 }
                     });
-                    let timer;
-                    const deadline = new Promise(resolve => {
-                        timer = setTimeout(() => resolve({ deadline: true }), acquireDeadline);
-                    });
-                    const raced = await Promise.race([
-                        pending.then(value => ({ value }), error => ({ error })),
-                        deadline
-                    ]);
-                    clearTimeout(timer);
-                    if (raced.deadline)
+                    const settled = pending.then(value => ({ value }), error => ({ error }));
+                    const racers = [settled];
+                    let timer = null;
+                    if (Number.isFinite(config.acquireDeadline)) {
+                        racers.push(new Promise(resolve => {
+                            timer = setTimeout(() => resolve({ deadline: true }), config.acquireDeadline);
+                        }));
+                    }
+                    if (config.ivLengthFault) {
+                        racers.push(new Promise(resolve => {
+                            notifyCipherRejection = (reason) => resolve({ cipherRejection: reason });
+                        }));
+                    }
+                    const raced = await Promise.race(racers);
+                    if (timer)
+                        clearTimeout(timer);
+                    notifyCipherRejection = null;
+                    if (raced.deadline) {
+                        timedOut = true;
                         return { hash: null, error: 'acquire did not finish', result: null };
+                    }
+                    if (raced.cipherRejection) {
+                        const reason = raced.cipherRejection;
+                        return { hash: null, error: reason && (reason.stack || reason.message || String(reason)), result: null };
+                    }
                     if (raced.error)
                         return { hash: null, error: raced.error && (raced.error.stack || raced.error.message || String(raced.error)), result: null };
                     return { hash: raced.value && raced.value.hash, error: null, result: raced.value };
                 } catch (error) {
+                    notifyCipherRejection = null;
                     return { hash: null, error: error && (error.stack || error.message || String(error)), result: null };
                 }
             };
@@ -910,6 +1065,9 @@ async function run(config) {
         }
         restoreCipherFault();
         restoreKeyFault();
+        restoreIvFault();
+        restoreDerivedLength();
+        restoreClientFault();
         restoreObserver();
 
         const contributions = readContributions(cluster.bus.wire);
@@ -961,6 +1119,16 @@ async function run(config) {
             wipeCounts[contribution] = count;
         }
         const cipherWiped = cipherBuffers.length > 0 && cipherBuffers.every(buffer => Buffer.isBuffer(buffer) && isZero(buffer));
+        const cipherIvs = cipherBuffers.filter(buffer => Buffer.isBuffer(buffer) && buffer.length === 16);
+        const overlaps = (left, right) => {
+            if (left.buffer !== right.buffer)
+                return false;
+            const leftStart = left.byteOffset;
+            const rightStart = right.byteOffset;
+            return leftStart < rightStart + right.byteLength && rightStart < leftStart + left.byteLength;
+        };
+        const ivDetachedFromHash = cryptoObservations.ivHashes.length > 0 && cipherIvs.length > 0
+            && cipherIvs.every(iv => cryptoObservations.ivHashes.every(hash => !overlaps(iv, hash)));
         const snapshots = fills.wiped.filter(buffer => buffer.length === 16 || buffer.length === 32).map(buffer => buffer.toString('hex'));
         return {
             attempts: ledger.attempts,
@@ -975,7 +1143,17 @@ async function run(config) {
             seedZero: contexts.length > 0 && contexts.every(ctx => namedBufferWiped(ctx, 'seed')),
             ivHashZero: contexts.length > 0 && contexts.every(ctx => namedBufferWiped(ctx, 'ivHash')),
             uncaught,
-            cryptoObservations,
+            timedOut,
+            inFlightClear: contexts.length > 0 && contexts.every(ctx => ctx.acquireInFlight === false),
+            cryptoObservations: {
+                hashes: cryptoObservations.hashes,
+                derives: cryptoObservations.derives,
+                originalsZero: {
+                    joined: buffersAllZero(cryptoObservations.joined),
+                    seed: buffersAllZero(cryptoObservations.seeds),
+                    ivHash: buffersAllZero(cryptoObservations.ivHashes)
+                }
+            },
             keyFound,
             ivIsSliceOfEphemeralKey,
             pubDerivedFromIv,
@@ -989,6 +1167,7 @@ async function run(config) {
             returns,
             wipeCounts,
             cipherWiped,
+            ivDetachedFromHash,
             snapshots
         };
     } finally {
@@ -1002,11 +1181,13 @@ async function run(config) {
     }
 }
 
-const { isMainThread, workerData } = require('worker_threads');
+const { isMainThread, workerData, parentPort } = require('worker_threads');
 
 function publish(config) {
     run(config).then((report) => {
         fs.writeFileSync(config.resultPath, JSON.stringify(report));
+        // A rejected cipher promise can stay pending. The report is already on disk.
+        process.exit(0);
     }).catch((error) => {
         const fatal = error && (error.stack || String(error));
         try {

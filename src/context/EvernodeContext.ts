@@ -433,11 +433,13 @@ class EvernodeContext {
     public async acquireSubmit(hostAddress: string, leaseOffer: URIToken, messageKey: string, options: AcquireOptions = {}): Promise<any> {
         if (this.acquireInFlight)
             throw new Error('acquire already in progress');
-        this.acquireInFlight = true;
-        // Get transaction details to use for xrpl tx submission.
-        const tenantClient = new evernode.TenantClient(this.xrplContext.xrplAcc.address);
+        // The flag and the client live in the block whose finally clears the flag.
+        // A throw from the constructor must not leave a later acquire stuck.
+        let tenantClient: any;
         try {
-        await tenantClient.connect();
+            this.acquireInFlight = true;
+            tenantClient = new evernode.TenantClient(this.xrplContext.xrplAcc.address);
+            await tenantClient.connect();
 
         // lclHash is public consensus data, so it cannot seed the cipher.
         // Peer links are hpws TLS 1.2+ with a self-signed per-node cert
@@ -456,10 +458,10 @@ class EvernodeContext {
         // This is strictly better than the public, deterministic lclHash.
         // Hex contribution votes cannot be wiped and may remain in
         // VoteContext.voteCollection until that election is resolved.
-        const preparedAcquireTxn = await this.#prepareAgreedAcquire(tenantClient, hostAddress, leaseOffer, messageKey, options);
-        await tenantClient.disconnect();
+            const preparedAcquireTxn = await this.#prepareAgreedAcquire(tenantClient, hostAddress, leaseOffer, messageKey, options);
+            await tenantClient.disconnect();
 
-        return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
+            return await this.xrplContext.multiSignAndSubmitTransaction(preparedAcquireTxn, options);
         } finally {
             this.acquireInFlight = false;
         }
@@ -503,16 +505,16 @@ class EvernodeContext {
     #requireAcquireUnl(): { publicKey: string }[] {
         const listed = this.hpContext.getContractUnl();
         if (!Array.isArray(listed) || listed.length < 1)
-            throw new Error('acquire consensus unavailable');
+            throw new Error('acquire UNL unavailable');
         const seen = new Set<string>();
         for (const node of listed) {
             const publicKey = node && node.publicKey;
             if (typeof publicKey !== 'string' || !ACQUIRE_UNL_KEY.test(publicKey))
-                throw new Error('acquire consensus unavailable');
+                throw new Error('acquire UNL unavailable');
             const identity = publicKey.toLowerCase();
             for (const existing of seen) {
                 if (existing.toLowerCase() === identity)
-                    throw new Error('acquire consensus unavailable');
+                    throw new Error('acquire UNL unavailable');
             }
             seen.add(publicKey);
         }
@@ -523,7 +525,7 @@ class EvernodeContext {
                 selfFound = true;
         }
         if (!selfFound)
-            throw new Error('acquire consensus unavailable');
+            throw new Error('acquire UNL unavailable');
         return listed;
     }
 

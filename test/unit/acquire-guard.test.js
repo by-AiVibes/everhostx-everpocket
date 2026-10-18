@@ -65,23 +65,42 @@ describe('Math.random stays banned with inline config disabled', { concurrency: 
 });
 
 async function assertAcquireRejects(fault) {
-    const started = Date.now();
-    let report;
+    let outcome;
     try {
-        report = await acquireInWorker(fault);
+        outcome = await acquireInWorker({ ephemeralKeyFault: fault });
     } catch (error) {
         if (error && error.timedOut)
             assert.fail('encrypt did not reject out-of-range key within 2s');
         throw error;
     }
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed < FAST_LIMIT_MS, `invalid ephemeral key must fail in under ${FAST_LIMIT_MS}ms, took ${elapsed}ms`);
+    assert.ok(outcome.elapsed < FAST_LIMIT_MS, `invalid ephemeral key must fail in under ${FAST_LIMIT_MS}ms, took ${outcome.elapsed}ms`);
+    const report = outcome.report;
     assert.match((report.errors || []).join('\n'), /acquire ephemeral key is not a valid secp256k1 private key/);
     assert.equal(report.attempts, 0, 'an invalid ephemeral key must not reach the ledger');
     assert.equal(report.landed, 0);
 }
 
-function acquireInWorker(fault) {
+test('a derived key of 0, 31, 33, or 64 bytes is rejected', async () => {
+    for (const length of [0, 31, 33, 64]) {
+        let outcome;
+        try {
+            outcome = await acquireInWorker({ derivedKeyLength: length });
+        } catch (error) {
+            if (error && error.timedOut)
+                assert.fail('derived key was not rejected with an error');
+            throw error;
+        }
+        const report = outcome.report;
+        const errors = (report.errors || []).join('\n');
+        assert.match(errors, /Error|acquire ephemeral key/, `a ${length}-byte derived key must be rejected with an Error`);
+        assert.equal(report.landed, 0, `a ${length}-byte derived key must not land`);
+        assert.equal(report.attempts, 0, `a ${length}-byte derived key must not be submitted`);
+        assert.equal((report.uncaught || []).length, 0, `a ${length}-byte derived key must not raise an uncaught error`);
+        assert.equal(report.inFlightClear, true, `a ${length}-byte derived key must clear the in-flight flag`);
+    }
+});
+
+function acquireInWorker(extra) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acquire-oor-'));
     const resultPath = path.join(root, 'cluster-result.json');
     const config = {
@@ -89,8 +108,8 @@ function acquireInWorker(fault) {
         lclHash: FIXED_LCL_HASH,
         rounds: 1,
         voteTimeout: 400,
-        ephemeralKeyFault: fault,
-        resultPath
+        resultPath,
+        ...extra
     };
     const previousCwd = process.cwd();
     // acquireSubmit writes acquires.json relative to cwd. A worker cannot
@@ -101,6 +120,8 @@ function acquireInWorker(fault) {
         let settled = false;
         let timedOut = false;
         let worker;
+        let clock = null;
+        let acquireStarted = 0;
         const restoreCwd = () => {
             try {
                 process.chdir(previousCwd);
@@ -112,14 +133,21 @@ function acquireInWorker(fault) {
             if (settled)
                 return;
             settled = true;
-            clearTimeout(timer);
+            clearTimeout(setupTimer);
+            if (clock)
+                clearTimeout(clock);
             restoreCwd();
             fn();
         };
-        const timer = setTimeout(() => {
-            timedOut = true;
-            worker.terminate();
-        }, FAST_LIMIT_MS);
+        // Setup is not part of the 2s budget. The budget starts when the worker
+        // says it is about to call acquireSubmit.
+        const setupTimer = setTimeout(() => {
+            if (worker)
+                worker.terminate();
+            const error = new Error('worker did not reach acquireSubmit');
+            error.setup = true;
+            finish(() => reject(error));
+        }, 60000);
         try {
             worker = new Worker(RUNNER, { workerData: config });
         } catch (error) {
@@ -129,6 +157,15 @@ function acquireInWorker(fault) {
             });
             return;
         }
+        worker.on('message', (message) => {
+            if (settled || clock || !message || message.event !== 'acquireSubmit')
+                return;
+            acquireStarted = Date.now();
+            clock = setTimeout(() => {
+                timedOut = true;
+                worker.terminate();
+            }, FAST_LIMIT_MS);
+        });
         worker.once('exit', () => {
             finish(() => {
                 if (timedOut) {
@@ -139,7 +176,10 @@ function acquireInWorker(fault) {
                     return;
                 }
                 try {
-                    resolve(JSON.parse(fs.readFileSync(resultPath, 'utf8')));
+                    resolve({
+                        report: JSON.parse(fs.readFileSync(resultPath, 'utf8')),
+                        elapsed: acquireStarted ? Date.now() - acquireStarted : 0
+                    });
                 } catch (error) {
                     reject(error);
                 } finally {
