@@ -4,6 +4,24 @@ import { Buffer } from 'buffer';
 import { EvernodeContext, VoteContext } from "../context";
 import { ClusterOptions, ClusterMessage, ClusterMessageResponse, ClusterMessageResponseStatus, ClusterMessageType, ClusterNode, PendingNode, OperationData, OperationType, AddNodeOperation, ExtendNodeOperation, RemoveNodeOperation, ClusterOwner, NodeStatus, NodeInfo, Operation } from "../models/cluster";
 import { ClusterManager } from "../cluster";
+import {
+    MAX_OPERATION_ATTEMPTS,
+    backoffLcl,
+    isOperationComplete,
+    operationAttempt,
+    operationNextAttemptLcl,
+    shouldPerformAdd,
+    stepAdvanceOperation,
+} from "../cluster/OperationQueueProcessor";
+import { FrozenRoundSnapshot, RoundSnapshot, computeAnchorLedger } from "../cluster/RoundSnapshot";
+import {
+    DEFAULT_FEE_CEILING,
+    deriveLastLedgerSequence,
+    deriveReplacementSignerKeypair,
+    acquireTxCanonicalFields,
+} from "../cluster/DeterministicTx";
+import { createHash } from 'crypto';
+import { RemoveNodeStep } from "../models/cluster";
 import { AllVoteElector } from "../vote/vote-electors";
 import { VoteElectorOptions } from "../models/vote";
 import HotPocketContext from "./HotPocketContext";
@@ -32,6 +50,9 @@ class ClusterContext {
     private acknowledgeLclThreshold: number;
     private acknowledgeRetryLclThreshold: number;
     private initialized: boolean = false;
+    private roundAborted: boolean = false;
+    private deferredAddPending: PendingNode[] = [];
+    private deferredOpCaps: { ref: string; acquireTxHash?: string; acquireLedgerCap?: number; extendTxHash?: string; extendLedgerCap?: number }[] = [];
     public hpContext: HotPocketContext;
     public voteContext: VoteContext;
     public evernodeContext: EvernodeContext;
@@ -60,21 +81,33 @@ class ClusterContext {
         if (this.initialized)
             return;
 
-        await this.evernodeContext.init();
+        this.roundAborted = false;
+        this.evernodeContext.applyDeferredAcquireWrites();
+        this.#applyDeferredClusterWrites();
 
         try {
+            await this.evernodeContext.bootstrapForRound();
+            const snapshot = await this.#captureRoundSnapshot();
+            const validatedXahau = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
+            if (snapshot.anchorLedger <= 0 || validatedXahau < snapshot.anchorLedger) {
+                this.roundAborted = true;
+                return;
+            }
+
+            await this.evernodeContext.xrplContext.reconcileValidatedTransactions(snapshot.anchorLedger);
+            await this.evernodeContext.finishRoundInit();
             await this.#setupClusterInfo();
             await this.#updateActiveness();
             const aliveCheckReached = await this.#checkForPendingNodes();
             await this.#checkForMatured();
             await this.#checkForAcknowledged();
             await this.#checkForExtends();
-            // We do not process operations if aliveness check is tried in this round.
-            // Because user connection takes time, So due to that some nodes might be unstable.
-            if (!aliveCheckReached)
-                await this.#processOperations();
+            // Defer only new ADD operations while a pending-node aliveness probe ran this round.
+            // REMOVE and EXTEND must still run so heal is not blocked by in-flight acquires.
+            await this.#processOperations(aliveCheckReached, snapshot);
             this.initialized = true;
         } catch (e) {
+            this.roundAborted = true;
             await this.deinit();
             throw e;
         }
@@ -84,10 +117,36 @@ class ClusterContext {
      * Deinitiates the operations regarding the cluster.
      */
     public async deinit(): Promise<void> {
-        this.clusterManager.persist();
-        this.#persistOperationData();
-        await this.evernodeContext.deinit();
+        if (!this.roundAborted) {
+            this.clusterManager.persist();
+            this.#persistOperationData();
+        }
+        await this.evernodeContext.deinit(this.roundAborted);
+        await this.evernodeContext.xrplContext.deinit(this.roundAborted);
         this.initialized = false;
+        this.roundAborted = false;
+    }
+
+    #applyDeferredClusterWrites(): void {
+        for (const p of this.deferredAddPending)
+            this.clusterManager.addPending(p);
+        this.deferredAddPending = [];
+        for (const patch of this.deferredOpCaps) {
+            const op = this.operationData.operations.find((o) => o.ref === patch.ref);
+            if (!op)
+                continue;
+            const data = op.data as any;
+            if (patch.acquireTxHash)
+                data.acquireTxHash = patch.acquireTxHash;
+            if (patch.acquireLedgerCap)
+                data.acquireLedgerCap = patch.acquireLedgerCap;
+            if (patch.extendTxHash)
+                data.extendTxHash = patch.extendTxHash;
+            if (patch.extendLedgerCap)
+                data.extendLedgerCap = patch.extendLedgerCap;
+        }
+        this.deferredOpCaps = [];
+        this.updatedData = true;
     }
 
     /**
@@ -119,13 +178,36 @@ class ClusterContext {
      * @param data Operation data.
      */
     #queueOperation(type: OperationType, ref: string, data: AddNodeOperation | ExtendNodeOperation | RemoveNodeOperation) {
-        if (!this.#hasPendingOperation(type, ref))
+        if (!this.#hasPendingOperation(type, ref)) {
+            if (type === OperationType.REMOVE_NODE) {
+                const removeData = data as RemoveNodeOperation;
+                if (!removeData.step)
+                    removeData.step = 'SIGNER';
+            }
             this.operationData.operations.push({
                 type: type,
                 ref: ref,
-                data: data
+                data: data,
+                createdLcl: this.hpContext.lclSeqNo,
+                attempt: 0,
+                nextAttemptLcl: 0,
             });
+        }
         this.updatedData = true;
+    }
+
+    public isRoundAborted(): boolean {
+        return this.roundAborted;
+    }
+
+    #touchAnchorLedger(): void {
+        const validated = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
+        this.operationData.anchorLedger = computeAnchorLedger(this.operationData, validated);
+        this.updatedData = true;
+    }
+
+    #ledgerReader() {
+        return this.evernodeContext.xrplContext;
     }
 
     /**
@@ -139,138 +221,261 @@ class ClusterContext {
     }
 
     /**
-     * Process operations one by one at each execution.
+     * First queued operation that may run this round (FIFO among eligible ops).
+     * @param deferAdd When true, skip ADD_NODE ops this round (pending aliveness probe).
      */
-    async #processOperations() {
-        if (this.operationData.operations.length === 0)
-            return;
+    #findProcessableOperationIndex(deferAdd: boolean, curLcl: number): number {
+        for (let i = 0; i < this.operationData.operations.length; i++) {
+            const op = this.operationData.operations[i];
+            if (deferAdd && op.type === OperationType.ADD_NODE)
+                continue;
+            const nextAttempt = operationNextAttemptLcl(op);
+            if (nextAttempt !== undefined && nextAttempt > curLcl)
+                continue;
+            return i;
+        }
+        return -1;
+    }
 
-        info(`Operations processor started.`);
+    async #captureRoundSnapshot(): Promise<FrozenRoundSnapshot> {
+        const config = await this.hpContext.getContractConfig();
+        const validated = this.evernodeContext.xrplContext.getValidatedLedgerIndex();
+        const anchor = computeAnchorLedger(this.operationData, validated);
+        const signerList = anchor > 0 && validated >= anchor
+            ? await this.evernodeContext.xrplContext.getSignerListAt(anchor)
+            : null;
+        const hostList = (config as any).evernode?.hosts ?? ['host.snapshot.test'];
+        return RoundSnapshot.capture({
+            lclSeqNo: this.hpContext.lclSeqNo,
+            lclHash: this.hpContext.lclHash,
+            operationData: JSON.parse(JSON.stringify(this.operationData)),
+            clusterData: this.clusterManager.snapshotClusterData(),
+            acquireData: this.evernodeContext.getAcquireDataSnapshot(),
+            contractUnl: config.unl,
+            signerListInfo: signerList,
+            tenantSequence: this.operationData.tenantSequence ?? 1,
+            tenantAddress: this.evernodeContext.xrplContext.xrplAcc?.address ?? 'rTenant',
+            feeCeiling: (config as any).evernode?.feeCeiling ?? DEFAULT_FEE_CEILING,
+            hostList,
+            validatedLedger: validated,
+        });
+    }
 
-        const operation = this.operationData.operations.splice(0, 1)[0];
-        this.updatedData = true;
+    async #onOperationDequeued(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<void> {
+        if (operation.type === OperationType.EXTEND_NODE) {
+            const data = operation.data as ExtendNodeOperation;
+            const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === data.nodePubkey);
+            if (snapNode && snapNode.lifeMoments < snapNode.targetLifeMoments)
+                this.clusterManager.increaseLifeMoments(data.nodePubkey, data.moments);
+        }
+    }
 
-        try {
+    async #performOperation(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<void> {
             if (operation.type === OperationType.ADD_NODE) {
                 const data = operation.data as AddNodeOperation;
+                if (!shouldPerformAdd(operation, snapshot))
+                    return;
 
                 log(`Acquiring a new node...`);
-                let acquire = (await this.evernodeContext.acquireNode(data.acquireOptions)) as PendingNode;
-                acquire.targetLifeMoments = data.lifeMoments;
-                acquire.maxLifeMoments = data.maxLifeMoments;
-                acquire.aliveCheckCount = 0;
-
-                this.clusterManager.addPending(acquire);
+                const acquire = await this.evernodeContext.acquireNodeFromSnapshot(snapshot, operation.ref, data.acquireOptions);
+                const pending = <PendingNode>{
+                    ...acquire,
+                    opRef: operation.ref,
+                    targetLifeMoments: data.lifeMoments,
+                    maxLifeMoments: data.maxLifeMoments,
+                    aliveCheckCount: 0,
+                };
+                this.deferredAddPending.push(pending);
+                this.deferredOpCaps.push({
+                    ref: operation.ref,
+                    acquireTxHash: acquire.refId,
+                    acquireLedgerCap: acquire.acquireLedgerCap,
+                });
             }
             else if (operation.type === OperationType.EXTEND_NODE) {
                 const data = operation.data as ExtendNodeOperation;
-                const clusterNodes = this.getClusterNodes();
-                const pendingExtend = clusterNodes.find(n => n.pubkey === data.nodePubkey);
-
-                if (pendingExtend) {
-                    log(`Extending node ${pendingExtend?.pubkey} by ${data.moments}...`);
-                    const res = await this.evernodeContext.extendSubmit(pendingExtend.host, data.moments, pendingExtend.name);
-                    if (res)
-                        this.clusterManager.increaseLifeMoments(pendingExtend.pubkey, data.moments);
+                if (data.extendTxHash)
+                    return;
+                const pendingExtend = this.getClusterNodes().find(n => n.pubkey === data.nodePubkey);
+                if (!pendingExtend)
+                    return;
+                log(`Extending node ${pendingExtend.pubkey} by ${data.moments}...`);
+                const res = await this.evernodeContext.extendSubmit(pendingExtend.host, data.moments, pendingExtend.name, {
+                    txSubmitInfo: this.evernodeContext.xrplContext.deriveTxSubmitInfo(snapshot),
+                });
+                if (res?.hash) {
+                    this.deferredOpCaps.push({
+                        ref: operation.ref,
+                        extendTxHash: res.hash,
+                        extendLedgerCap: deriveLastLedgerSequence(snapshot),
+                    });
                 }
             }
             else if (operation.type === OperationType.REMOVE_NODE) {
-                const data = operation.data as RemoveNodeOperation;
+                await this.#performRemoveStep(operation, snapshot);
+            }
+    }
 
-                // If there ares pending acquires, There could be issues while removing the node.
-                if (!data.force && this.getPendingNodes().length > 0)
-                    throw 'Nodes cannot be removed, There are pending acquires.'
+    async #signerStillOnXahau(signerAddress: string, anchorLedger: number): Promise<boolean> {
+        if (!signerAddress || anchorLedger <= 0)
+            return false;
+        const list = await this.#ledgerReader().getSignerListAt(anchorLedger);
+        return !!list?.signerList.some((s) => s.account === signerAddress);
+    }
 
-                const pubkey = data.nodePubkey;
-                const node = this.clusterManager.getNode(pubkey);
+    #deterministicPick(sorted: string[], salt: string): string {
+        const h = createHash('sha256').update(salt).digest();
+        return sorted[h.readUInt32BE(0) % sorted.length];
+    }
 
-                log(`Removing the node ${pubkey}...`);
+    async #performRemoveStep(operation: Operation, snapshot: FrozenRoundSnapshot): Promise<void> {
+        const data = operation.data as RemoveNodeOperation;
+        if (!data.force && this.getPendingNodes().length > 0)
+            throw 'Nodes cannot be removed, There are pending acquires.';
 
-                if (node?.signerAddress) {
-                    const nonQuorumNodes = this.getClusterUnlNodes().filter(n => !n.signerAddress);
+        const pubkey = data.nodePubkey;
+        const step: RemoveNodeStep = data.step ?? 'SIGNER';
+        const snapNode = snapshot.cluster.nodes.find((n) => n.pubkey === pubkey);
+        const node = this.clusterManager.getNode(pubkey);
+        const anchor = snapshot.anchorLedger;
 
-                    if (nonQuorumNodes.length > 0 && (node?.signerReplaceFailedAttempts || 0) < MAX_SIGNER_REPLACE_ATTEMPTS) {
-                        // Generate new multi signer if this node is not already a signer.
-                        let newSignerKey, newSignerAddress;
-                        if (!this.evernodeContext.xrplContext.multiSigner.isSignerNode()) {
-                            // Generate new multi signer;
-                            newSignerKey = this.evernodeContext.xrplContext.multiSigner.generateSigner();
-                            newSignerAddress = newSignerKey.account;
-                        }
+        log(`Removing the node ${pubkey} (step ${step})...`);
 
-                        const txSubmitInfo = await this.evernodeContext.xrplContext.getTransactionSubmissionInfo({},
-                            newSignerAddress ? <DecisionOptions>{ key: this.hpContext.publicKey, options: { signerAddress: newSignerAddress } } : null);
+        if (step === 'SIGNER') {
+            const signerAddr = snapNode?.signerAddress;
+            if (!signerAddr)
+                return;
+            if (!(await this.#signerStillOnXahau(signerAddr, anchor)))
+                return;
 
-                        const newSignerPubkey = txSubmitInfo.options?.key;
-                        newSignerAddress = txSubmitInfo.options?.options?.signerAddress;
+            const candidates = snapshot.cluster.nodes
+                .filter((n) => n.pubkey !== pubkey && !n.signerAddress)
+                .map((n) => n.pubkey)
+                .sort();
+            const txSubmitInfo = this.evernodeContext.xrplContext.deriveTxSubmitInfo(snapshot);
 
-                        if (newSignerPubkey && newSignerAddress) {
-                            log(`Replacing the signer ${pubkey} with ${newSignerPubkey}...`);
-                            try {
-                                await this.evernodeContext.xrplContext.replaceSignerList(node.signerAddress, newSignerAddress, { txSubmitInfo: txSubmitInfo });
-                                this.clusterManager.markAsQuorum(newSignerPubkey, newSignerAddress);
-
-                                // Set new signer if new signer is self.
-                                if (newSignerPubkey === this.hpContext.publicKey && newSignerKey)
-                                    this.evernodeContext.xrplContext.multiSigner.setSigner(newSignerKey);
-
-                                // Remove old signer if old signer is self.
-                                if (pubkey === this.hpContext.publicKey)
-                                    this.evernodeContext.xrplContext.multiSigner.removeSigner();
-                            }
-                            catch (e) {
-                                this.clusterManager.increaseSignerReplaceFailedAttempts(pubkey);
-                                throw e;
-                            }
-                        } else {
-                            this.clusterManager.increaseSignerReplaceFailedAttempts(pubkey);
-                            throw `No NON-Quorum node was found to replace ${pubkey} signer node.`;
-                        }
+            if (candidates.length > 0 && node?.signerAddress) {
+                const nonQuorumPubkey = this.#deterministicPick(candidates, `${operation.ref}|signer`);
+                const derived = deriveReplacementSignerKeypair(snapshot, pubkey, nonQuorumPubkey);
+                await this.evernodeContext.xrplContext.replaceSignerList(
+                    node.signerAddress,
+                    derived.account,
+                    { txSubmitInfo },
+                );
+                this.deferredOpCaps.push({ ref: operation.ref, acquireLedgerCap: txSubmitInfo.maxLedgerSequence });
+                this.clusterManager.markAsQuorum(nonQuorumPubkey, derived.account);
+                this.clusterManager.clearSignerAddress(pubkey);
+            } else if (node?.signerAddress) {
+                const quorumPubkeys = snapshot.cluster.nodes
+                    .filter((n) => n.signerAddress && n.pubkey !== pubkey)
+                    .map((n) => n.pubkey)
+                    .sort();
+                if (quorumPubkeys.length > 0) {
+                    const pickPub = this.#deterministicPick(quorumPubkeys, `${operation.ref}|transfer`);
+                    const pickNode = snapshot.cluster.nodes.find((n) => n.pubkey === pickPub);
+                    if (pickNode?.signerAddress) {
+                        await this.evernodeContext.xrplContext.replaceSignerList(node.signerAddress, pickNode.signerAddress, { txSubmitInfo });
+                        this.deferredOpCaps.push({ ref: operation.ref, acquireLedgerCap: txSubmitInfo.maxLedgerSequence });
+                        this.clusterManager.clearSignerAddress(pubkey);
                     }
-                    else {
-                        if ((node?.signerReplaceFailedAttempts || 0) >= MAX_SIGNER_REPLACE_ATTEMPTS)
-                            error(`${MAX_SIGNER_REPLACE_ATTEMPTS} attempts on signer replacement failed`);
-                        else
-                            log("There are no non quorum nodes to replace signer");
-
-                        log("Transferring the signer.");
-                        // Try to remove the signer and add it's weight to a random signer.
-                        const quorumNodes = this.getClusterUnlNodes().filter(n => n.signerAddress).sort((a, b) => a.pubkey.localeCompare(b.pubkey));
-                        const randomIndex = NumberHelpers.getRandomNumber(this.hpContext, 0, quorumNodes.length);
-                        const newSignerNode = quorumNodes[randomIndex];
-                        try {
-                            await this.evernodeContext.xrplContext.replaceSignerList(node.signerAddress, newSignerNode.signerAddress!);
-                        }
-                        catch (e) {
-                            if ((node?.signerReplaceFailedAttempts || 0) >= MAX_SIGNER_REPLACE_ATTEMPTS)
-                                error("Signer transfer failed. Skip altering the signer list. ", e);
-                            else {
-                                this.clusterManager.increaseSignerReplaceFailedAttempts(pubkey);
-                                throw `No NON-Quorum node was found to replace ${pubkey} signer node.`;
-                            }
-
-                        }
-                    }
-                }
-
-                // Update patch config if node exists in UNL.
-                let config = await this.hpContext.getContractConfig();
-                const idx = config.unl.findIndex((p: string) => p === pubkey);
-                if (idx > -1) {
-                    config.unl.splice(idx, 1);
-                    await this.hpContext.updateContractConfig(config);
-                }
-
-                // Update peer list.
-                if (node) {
-                    if (node?.domain && node?.peerPort) {
-                        let peer = `${node?.domain}:${node?.peerPort}`
-                        await this.hpContext.updatePeers(null, [peer]);
-                    }
-
-                    this.clusterManager.removeNode(pubkey);
                 }
             }
+            return;
+        }
+
+        if (step === 'UNL') {
+            if (!snapshot.unl.includes(pubkey))
+                return;
+            const config = await this.hpContext.getContractConfig();
+            if (config.unl.includes(pubkey)) {
+                await this.hpContext.updateContractConfig({
+                    ...config,
+                    unl: config.unl.filter((p: string) => p !== pubkey),
+                });
+            }
+            return;
+        }
+
+        if (step === 'PEER') {
+            if (!snapshot.cluster.nodes.some((n) => n.pubkey === pubkey))
+                return;
+            const clusterNode = this.clusterManager.getNode(pubkey);
+            if (clusterNode?.domain && clusterNode?.peerPort) {
+                const peer = `${clusterNode.domain}:${clusterNode.peerPort}`;
+                await this.hpContext.updatePeers(null, [peer]);
+            }
+            this.clusterManager.removeNode(pubkey);
+        }
+    }
+
+    async #reconcileRemoveZombieFromConsensusUnl(pubkey: string): Promise<void> {
+        const config = await this.hpContext.getContractConfig();
+        if (config.unl.findIndex((p: string) => p === pubkey) === -1 && this.clusterManager.getNode(pubkey))
+            this.clusterManager.removeNode(pubkey);
+    }
+
+    /**
+     * Process operations one by one at each execution.
+     */
+    async #processOperations(deferAdd: boolean = false, snapshot: FrozenRoundSnapshot) {
+        if (this.operationData.operations.length === 0)
+            return;
+
+        const curLcl = this.hpContext.lclSeqNo;
+        const operationIndex = this.#findProcessableOperationIndex(deferAdd, curLcl);
+        if (operationIndex < 0)
+            return;
+
+        const operation = this.operationData.operations[operationIndex];
+        const ledger = this.#ledgerReader();
+
+        info(`Operations processor started.`);
+
+        if (await isOperationComplete(operation, snapshot, ledger)) {
+            await this.#onOperationDequeued(operation, snapshot);
+            this.operationData.operations.splice(operationIndex, 1);
+            this.updatedData = true;
+            info(`Operations processor ended.`);
+            return;
+        }
+
+        await stepAdvanceOperation(operation, snapshot, ledger);
+        if (operation.type === OperationType.ADD_NODE && (operation.data as AddNodeOperation).messagePublicKey)
+            this.updatedData = true;
+
+        if (await isOperationComplete(operation, snapshot, ledger)) {
+            await this.#onOperationDequeued(operation, snapshot);
+            this.operationData.operations.splice(operationIndex, 1);
+            this.updatedData = true;
+            info(`Operations processor ended.`);
+            return;
+        }
+
+        if ((operationNextAttemptLcl(operation) ?? 0) > curLcl) {
+            info(`Operations processor ended.`);
+            return;
+        }
+
+        const attempt = operationAttempt(operation) + 1;
+        operation.attempt = attempt;
+        delete operation.retryCount;
+        operation.nextAttemptLcl = curLcl + backoffLcl(attempt);
+        delete operation.nextRetryLcl;
+        this.updatedData = true;
+
+        if (attempt > MAX_OPERATION_ATTEMPTS) {
+            error(`Dropping operation ${operation.ref} after ${MAX_OPERATION_ATTEMPTS} failed attempts.`);
+            if (operation.type === OperationType.REMOVE_NODE) {
+                const pubkey = (operation.data as RemoveNodeOperation).nodePubkey;
+                await this.#reconcileRemoveZombieFromConsensusUnl(pubkey);
+            }
+            this.operationData.operations.splice(operationIndex, 1);
+            info(`Operations processor ended.`);
+            return;
+        }
+
+        try {
+            await this.#performOperation(operation, snapshot);
         } catch (e) {
             error(e);
         }
@@ -354,6 +559,7 @@ class ClusterContext {
 
                         this.clusterManager.addNode(<ClusterNode>{
                             refId: node.refId,
+                            addOpRef: node.opRef,
                             contractId: info.contractId,
                             status: {
                                 status: NodeStatus.CREATED,
